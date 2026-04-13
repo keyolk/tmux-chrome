@@ -54,16 +54,16 @@ EOF
 
 echo "[4/5] Installed native messaging host manifest: $MANIFEST_PATH"
 
-# 5. Add tmux hooks
+# 5. Add tmux hooks (local only)
 if grep -q "tmux-chrome" ~/.tmux.conf 2>/dev/null; then
   echo "[5/5] tmux hooks already exist in ~/.tmux.conf (skipped)"
 else
   cat >> ~/.tmux.conf << 'HOOKS'
 
-# tmux-chrome tab group bridge
-set-hook -g after-select-window 'run-shell -b "~/.local/bin/tmux-chrome switch"'
-set-hook -g after-rename-window 'run-shell -b "~/.local/bin/tmux-chrome rename"'
-set-option -g @extrakto_open_tool "~/.local/bin/tmux-chrome open"
+# tmux-chrome tab group bridge (local only)
+if-shell 'test -z "$SSH_CLIENT$SSH_CONNECTION$SSH_TTY"' \
+  'set-hook -g after-select-window '\''run-shell -b "~/.local/bin/tmux-chrome switch"'\''; set-hook -g after-rename-window '\''run-shell -b "~/.local/bin/tmux-chrome rename"'\''; set-option -g @extrakto_open_tool "~/.local/bin/tmux-chrome open"' \
+  'set -u @extrakto_open_tool'
 HOOKS
   echo "[5/5] Added tmux hooks to ~/.tmux.conf"
 fi
