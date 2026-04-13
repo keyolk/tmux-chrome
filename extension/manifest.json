@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "tmux Tab Group Bridge",
+  "version": "1.0",
+  "description": "Syncs Chrome tab groups with tmux windows via native messaging",
+  "permissions": ["tabGroups", "tabs", "nativeMessaging"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

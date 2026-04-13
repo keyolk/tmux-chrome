@@ -1,0 +1,280 @@
+#!/bin/bash
+# tmux-chrome — CLI for tmux ↔ Chrome tab group bridge
+# Communicates with bridge.py via Unix socket at /tmp/tmux-chrome-bridge.sock
+
+set -eo pipefail
+
+CHROME_BRIDGE_SOCKET="/tmp/tmux-chrome-bridge.sock"
+
+function chrome_cmd {
+  local json="$1"
+
+  if [[ ! -S "$CHROME_BRIDGE_SOCKET" ]]; then
+    echo "Error: Chrome bridge not running (socket not found)" >&2
+    return 1
+  fi
+
+  python3 -c "
+import socket, sys, json
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+try:
+    s.connect('$CHROME_BRIDGE_SOCKET')
+    s.sendall(('''$json''' + '\n').encode())
+    data = b''
+    while True:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+        if b'\n' in data:
+            break
+    print(data.decode().strip())
+except Exception as e:
+    print(json.dumps({'success': False, 'error': str(e)}))
+finally:
+    s.close()
+" 2>/dev/null
+}
+
+function request_id {
+  echo "req_$(date +%s%N | cut -c1-13)"
+}
+
+function cmd_switch {
+  local window_name="${1:-$(tmux display-message -p '#W')}"
+  local id
+  id=$(request_id)
+  chrome_cmd "{\"type\":\"switch_window\",\"window_name\":\"$window_name\",\"id\":\"$id\"}" > /dev/null 2>&1
+}
+
+function cmd_list {
+  local id
+  id=$(request_id)
+  local response
+  response=$(chrome_cmd "{\"type\":\"list_groups\",\"id\":\"$id\"}")
+
+  if [[ -z "$response" ]]; then
+    echo "No response from Chrome bridge" >&2
+    return 1
+  fi
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" != "true" ]]; then
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+
+  echo "$response" | jq -r '.data[] | "\(.title)\t\(.tab_count) tabs\t\(if .collapsed then "collapsed" else "expanded" end)"' | column -t -s $'\t'
+}
+
+function cmd_delete {
+  local group_name="${1:-$(tmux display-message -p '#W')}"
+  local id
+  id=$(request_id)
+  local response
+  response=$(chrome_cmd "{\"type\":\"delete_group\",\"name\":\"$group_name\",\"id\":\"$id\"}")
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" == "true" ]]; then
+    echo "Deleted tab group: $group_name"
+  else
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+}
+
+function cmd_add {
+  local url="$1"
+  if [[ -z "$url" ]]; then
+    echo "Usage: tmux-chrome add <url>" >&2
+    return 1
+  fi
+  local group_name
+  group_name=$(tmux display-message -p '#W')
+  local id
+  id=$(request_id)
+  local response
+  response=$(chrome_cmd "{\"type\":\"add_tab\",\"name\":\"$group_name\",\"url\":\"$url\",\"id\":\"$id\"}")
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" == "true" ]]; then
+    local created
+    created=$(echo "$response" | jq -r '.data.created_group // false')
+    if [[ "$created" == "true" ]]; then
+      echo "Created group '$group_name' and added tab: $url"
+    else
+      echo "Added tab to '$group_name': $url"
+    fi
+  else
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+}
+
+function cmd_move {
+  local group_name
+  group_name=$(tmux display-message -p '#W')
+  local id
+  id=$(request_id)
+  local response
+  response=$(chrome_cmd "{\"type\":\"move_tab\",\"name\":\"$group_name\",\"id\":\"$id\"}")
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" == "true" ]]; then
+    echo "Moved active tab to group: $group_name"
+  else
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+}
+
+function cmd_remove {
+  local id
+  id=$(request_id)
+  local response
+  response=$(chrome_cmd "{\"type\":\"remove_tab\",\"id\":\"$id\"}")
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" == "true" ]]; then
+    echo "Removed active tab from its group"
+  else
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+}
+
+function cmd_grab {
+  local group_name
+  group_name=$(tmux display-message -p '#W')
+  local window_index
+  window_index=$(tmux display-message -p '#{window_index}')
+
+  local extracted
+  extracted=$(
+    for pane_index in $(tmux list-panes -t ":${window_index}" -F '#{pane_index}'); do
+      tmux capture-pane -p -t ":${window_index}.${pane_index}" -S -500 2>/dev/null
+    done | grep -oE 'https?://[A-Za-z0-9._~:/?#@!$&()*+,;=%[-]+' | sed 's/[.,;:!)]*$//' | sort -u
+  )
+
+  if [[ -z "$extracted" ]]; then
+    echo "No URLs found in current window panes" >&2
+    return 1
+  fi
+
+  local selected
+  selected=$(echo "$extracted" | fzf \
+    --multi \
+    --header="Select URLs to add to tab group '$group_name' (Tab to multi-select)" \
+    --preview='echo {}' \
+    --preview-window=down:1:wrap)
+
+  if [[ -z "$selected" ]]; then
+    return 0
+  fi
+
+  local count=0
+  while IFS= read -r url; do
+    if [[ -n "$url" ]]; then
+      local id
+      id=$(request_id)
+      chrome_cmd "{\"type\":\"add_tab\",\"name\":\"$group_name\",\"url\":\"$url\",\"id\":\"$id\"}" > /dev/null
+      ((count++))
+    fi
+  done <<< "$selected"
+
+  echo "Added $count tab(s) to group '$group_name'"
+}
+
+function cmd_tabs {
+  local all_flag=""
+  local group_name
+  group_name=$(tmux display-message -p '#W')
+
+  if [[ "$1" == "--all" ]]; then
+    all_flag="true"
+  fi
+
+  local id
+  id=$(request_id)
+  local response
+
+  if [[ -n "$all_flag" ]]; then
+    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"all\":true,\"id\":\"$id\"}")
+  else
+    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"name\":\"$group_name\",\"id\":\"$id\"}")
+  fi
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" != "true" ]]; then
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+
+  local tab_count
+  tab_count=$(echo "$response" | jq '.data | length')
+  if [[ "$tab_count" == "0" ]]; then
+    echo "No tabs found" >&2
+    return 1
+  fi
+
+  local fzf_input
+  fzf_input=$(echo "$response" | jq -r '.data[] | "\(.id)\t[\(.group_title)] \(.title)\t\(.url)"')
+
+  local selected
+  selected=$(echo "$fzf_input" | fzf \
+    --header="Select a tab to focus (terminal stays focused)" \
+    --delimiter=$'\t' \
+    --with-nth='2,3' \
+    --preview='echo {3}' \
+    --preview-window=down:1:wrap)
+
+  if [[ -z "$selected" ]]; then
+    return 0
+  fi
+
+  local tab_id
+  tab_id=$(echo "$selected" | cut -f1)
+
+  local focus_id
+  focus_id=$(request_id)
+  chrome_cmd "{\"type\":\"focus_tab\",\"tab_id\":$tab_id,\"id\":\"$focus_id\"}" > /dev/null
+  echo "Focused tab: $(echo "$selected" | cut -f2)"
+}
+
+function main {
+  local subcmd="${1:-}"
+  shift 2>/dev/null || true
+
+  case "$subcmd" in
+    switch)  cmd_switch "$@" ;;
+    list)    cmd_list ;;
+    delete)  cmd_delete "$@" ;;
+    add)     cmd_add "$@" ;;
+    move)    cmd_move ;;
+    remove)  cmd_remove ;;
+    grab)    cmd_grab ;;
+    tabs)    cmd_tabs "$@" ;;
+    *)
+      echo "Usage: tmux-chrome {switch|list|delete|add|move|remove|grab|tabs}"
+      echo ""
+      echo "  switch          Switch to tab group matching current tmux window"
+      echo "  list            List all tab groups"
+      echo "  delete          Delete tab group for current window"
+      echo "  add <url>       Add URL to current window's tab group"
+      echo "  move            Move Chrome's active tab to current window's group"
+      echo "  remove          Remove Chrome's active tab from its group"
+      echo "  grab            Extract URLs from panes → fzf → add to tab group"
+      echo "  tabs [--all]    Browse tabs in group via fzf → focus selected"
+      return 1
+      ;;
+  esac
+}
+
+main "$@"
