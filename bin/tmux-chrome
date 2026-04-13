@@ -111,7 +111,12 @@ function cmd_delete {
 }
 
 function cmd_focus {
-  osascript -e 'tell application "Google Chrome" to activate' 2>/dev/null
+  local app="${1:-chrome}"
+  case "$app" in
+    chrome)  osascript -e 'tell application "Google Chrome" to activate' 2>/dev/null ;;
+    slack)   osascript -e 'tell application "Slack" to activate' 2>/dev/null ;;
+    *)       osascript -e "tell application \"$app\" to activate" 2>/dev/null ;;
+  esac
 }
 
 function cmd_open {
@@ -309,7 +314,7 @@ function main {
     list)    cmd_list ;;
     delete)  cmd_delete "$@" ;;
     open)    cmd_open "$@" ;;
-    focus)   cmd_focus ;;
+    focus)   cmd_focus "$@" ;;
     add)     cmd_add "$@" ;;
     move)    cmd_move ;;
     remove)  cmd_remove ;;
@@ -323,7 +328,7 @@ function main {
       echo "  rename          Rename tab group to match current tmux window name"
       echo "  list            List all tab groups"
       echo "  delete          Delete tab group for current window"
-      echo "  focus           Bring Chrome to foreground"
+      echo "  focus [app]     Bring app to foreground (chrome, slack, or any app name)"
       echo "  open <url>      Open URL directly into current window's tab group"
       echo "  add <url>       Add URL to current window's tab group"
       echo "  move            Move Chrome's active tab to current window's group"
