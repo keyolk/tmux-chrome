@@ -43,11 +43,13 @@ function request_id {
 
 function cmd_switch {
   local window_name="${1:-$(tmux display-message -p '#W')}"
-  local id
-  id=$(request_id)
-  chrome_cmd "{\"type\":\"switch_window\",\"window_name\":\"$window_name\",\"id\":\"$id\"}" > /dev/null 2>&1
   # Track current group name for rename detection
   tmux set-option -qw @chrome_group "$window_name" 2>/dev/null
+  # Silently skip if bridge is not running
+  [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 0
+  local id
+  id=$(request_id)
+  chrome_cmd "{\"type\":\"switch_window\",\"window_name\":\"$window_name\",\"id\":\"$id\"}" > /dev/null 2>&1 || true
 }
 
 function cmd_rename {
@@ -56,14 +58,18 @@ function cmd_rename {
   local new_name
   new_name=$(tmux display-message -p '#W')
 
+  # Update tracking regardless of bridge state
+  tmux set-option -qw @chrome_group "$new_name" 2>/dev/null
+
   if [[ -z "$old_name" || "$old_name" == "$new_name" ]]; then
     return 0
   fi
 
+  # Silently skip if bridge is not running
+  [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 0
   local id
   id=$(request_id)
-  chrome_cmd "{\"type\":\"rename_group\",\"old_name\":\"$old_name\",\"new_name\":\"$new_name\",\"id\":\"$id\"}" > /dev/null 2>&1
-  tmux set-option -qw @chrome_group "$new_name" 2>/dev/null
+  chrome_cmd "{\"type\":\"rename_group\",\"old_name\":\"$old_name\",\"new_name\":\"$new_name\",\"id\":\"$id\"}" > /dev/null 2>&1 || true
 }
 
 function cmd_list {
