@@ -261,4 +261,15 @@ async function renameGroup(oldName, newName) {
 }
 
 // --- Init ---
+// Connect on service worker load (extension install/update/reload)
 connect();
+
+// Also connect on Chrome startup (service worker may not auto-load after restart)
+chrome.runtime.onStartup.addListener(() => {
+  if (!port) connect();
+});
+
+// And on extension install/update
+chrome.runtime.onInstalled.addListener(() => {
+  if (!port) connect();
+});

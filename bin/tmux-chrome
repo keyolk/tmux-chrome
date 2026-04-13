@@ -41,6 +41,54 @@ function request_id {
   echo "req_$(date +%s%N | cut -c1-13)"
 }
 
+CHROME_EXTENSION_ID="${TMUX_CHROME_EXT_ID:-dplackkpcodnphbdcmfppmcbhkonlecg}"
+
+function cmd_reload {
+  # Toggle extension off→on via AppleScript to restart service worker + bridge
+  echo "Reloading extension..."
+  osascript <<APPLESCRIPT
+tell application "Google Chrome"
+    open location "chrome://extensions/?id=$CHROME_EXTENSION_ID"
+    delay 0.5
+    tell active tab of front window
+        execute javascript "
+            const mgr = document.querySelector('extensions-manager');
+            const dv = mgr.shadowRoot.querySelector('extensions-detail-view');
+            if (dv) { dv.shadowRoot.querySelector('#enable-toggle').click(); }
+            'off';
+        "
+    end tell
+    delay 0.5
+    tell active tab of front window
+        execute javascript "
+            const mgr = document.querySelector('extensions-manager');
+            const dv = mgr.shadowRoot.querySelector('extensions-detail-view');
+            if (dv) { dv.shadowRoot.querySelector('#enable-toggle').click(); }
+            'on';
+        "
+    end tell
+    delay 0.3
+    tell active tab of front window
+        execute javascript "window.close();"
+    end tell
+end tell
+APPLESCRIPT
+
+  # Wait for socket
+  local tries=0
+  while [[ ! -S "$CHROME_BRIDGE_SOCKET" ]] && [[ $tries -lt 10 ]]; do
+    sleep 0.5
+    ((tries++))
+  done
+
+  if [[ -S "$CHROME_BRIDGE_SOCKET" ]]; then
+    echo "Bridge reconnected"
+  else
+    echo "Error: Bridge did not reconnect" >&2
+    return 1
+  fi
+}
+
 function cmd_switch {
   local window_name="${1:-$(tmux display-message -p '#W')}"
   # Track current group name for rename detection
@@ -321,8 +369,9 @@ function main {
     grab)    cmd_grab ;;
     tabs)    cmd_tabs "$@" ;;
     rename)  cmd_rename ;;
+    reload)  cmd_reload ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|grab|tabs|rename}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|grab|tabs|rename|reload|focus}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -335,6 +384,7 @@ function main {
       echo "  remove          Remove Chrome's active tab from its group"
       echo "  grab            Extract URLs from panes → fzf → add to tab group"
       echo "  tabs [--all]    Browse tabs in group via fzf → focus selected"
+      echo "  reload          Restart Chrome extension and reconnect bridge"
       return 1
       ;;
   esac
