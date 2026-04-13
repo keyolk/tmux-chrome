@@ -69,6 +69,8 @@ async function handleMessage(msg) {
       return getTabs(msg.name, msg.all);
     case "focus_tab":
       return focusTab(msg.tab_id);
+    case "rename_group":
+      return renameGroup(msg.old_name, msg.new_name);
     default:
       throw new Error(`Unknown message type: ${msg.type}`);
   }
@@ -248,6 +250,14 @@ async function focusTab(tabId) {
   }
 
   return { tab_id: tabId, group_id: tab.groupId };
+}
+
+async function renameGroup(oldName, newName) {
+  const group = await findGroupByTitle(oldName);
+  if (!group) throw new Error(`Tab group "${oldName}" not found`);
+
+  await chrome.tabGroups.update(group.id, { title: newName });
+  return { group_id: group.id, old_name: oldName, new_name: newName };
 }
 
 // --- Init ---

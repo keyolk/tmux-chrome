@@ -46,6 +46,24 @@ function cmd_switch {
   local id
   id=$(request_id)
   chrome_cmd "{\"type\":\"switch_window\",\"window_name\":\"$window_name\",\"id\":\"$id\"}" > /dev/null 2>&1
+  # Track current group name for rename detection
+  tmux set-option -qw @chrome_group "$window_name" 2>/dev/null
+}
+
+function cmd_rename {
+  local old_name
+  old_name=$(tmux show-option -qvw @chrome_group 2>/dev/null)
+  local new_name
+  new_name=$(tmux display-message -p '#W')
+
+  if [[ -z "$old_name" || "$old_name" == "$new_name" ]]; then
+    return 0
+  fi
+
+  local id
+  id=$(request_id)
+  chrome_cmd "{\"type\":\"rename_group\",\"old_name\":\"$old_name\",\"new_name\":\"$new_name\",\"id\":\"$id\"}" > /dev/null 2>&1
+  tmux set-option -qw @chrome_group "$new_name" 2>/dev/null
 }
 
 function cmd_list {
@@ -261,10 +279,12 @@ function main {
     remove)  cmd_remove ;;
     grab)    cmd_grab ;;
     tabs)    cmd_tabs "$@" ;;
+    rename)  cmd_rename ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|add|move|remove|grab|tabs}"
+      echo "Usage: tmux-chrome {switch|list|delete|add|move|remove|grab|tabs|rename}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
+      echo "  rename          Rename tab group to match current tmux window name"
       echo "  list            List all tab groups"
       echo "  delete          Delete tab group for current window"
       echo "  add <url>       Add URL to current window's tab group"
