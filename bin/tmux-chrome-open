@@ -1,0 +1,18 @@
+#!/bin/bash
+# $BROWSER wrapper — opens URLs in the correct tmux-chrome tab group
+# Falls back to native Chrome if not in tmux or bridge is down
+
+url="$1"
+[[ -z "$url" ]] && exit 1
+
+# If inside tmux and bridge socket exists, use grouped open
+if [[ -n "$TMUX" ]] && [[ -S /tmp/tmux-chrome-bridge.sock ]]; then
+  exec tmux-chrome open "$url"
+fi
+
+# Fallback: open with system default
+if [[ "$(uname)" == "Darwin" ]]; then
+  exec open "$url"
+else
+  exec xdg-open "$url" 2>/dev/null
+fi

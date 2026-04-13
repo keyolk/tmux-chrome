@@ -17,9 +17,10 @@ uninstall: unlink
 link:
 	@mkdir -p $(PREFIX)/bin
 	@ln -sf $(CURDIR)/bin/tmux-chrome $(PREFIX)/bin/tmux-chrome
+	@ln -sf $(CURDIR)/bin/tmux-chrome-open $(PREFIX)/bin/tmux-chrome-open
 
 unlink:
-	@rm -f $(PREFIX)/bin/tmux-chrome
+	@rm -f $(PREFIX)/bin/tmux-chrome $(PREFIX)/bin/tmux-chrome-open
 
 raycast-dev:
 	@cd raycast && bun install && bun run dev
