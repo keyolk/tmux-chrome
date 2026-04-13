@@ -4,12 +4,27 @@
 
 const NATIVE_HOST = "com.tmux.chrome.bridge";
 let port = null;
+let reconnectTimer = null;
+let reconnectDelay = 5000; // start at 5s
+const MAX_RECONNECT_DELAY = 300000; // cap at 5 minutes
+let lastConnectTime = 0;
 
 function connect() {
+  // Prevent multiple simultaneous connections
+  if (port) return;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  const now = Date.now();
+  lastConnectTime = now;
+
   try {
     port = chrome.runtime.connectNative(NATIVE_HOST);
   } catch (e) {
     console.error("Failed to connect to native host:", e);
+    port = null;
     scheduleReconnect();
     return;
   }
@@ -27,14 +42,28 @@ function connect() {
     const err = chrome.runtime.lastError;
     console.log("Native host disconnected:", err?.message || "unknown");
     port = null;
+
+    // If connection lasted > 30s, it was a real session — reset backoff
+    if (Date.now() - lastConnectTime > 30000) {
+      reconnectDelay = 5000;
+    }
     scheduleReconnect();
   });
 
+  // Connection succeeded and held — reset backoff
   console.log("Connected to native host");
+  reconnectDelay = 5000;
 }
 
 function scheduleReconnect() {
-  setTimeout(connect, 5000);
+  if (reconnectTimer) return; // already scheduled
+  console.log(`Reconnecting in ${reconnectDelay / 1000}s...`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connect();
+  }, reconnectDelay);
+  // Exponential backoff: 5s → 10s → 20s → 40s → ... → 5min cap
+  reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
 }
 
 function sendToHost(msg) {
@@ -261,15 +290,7 @@ async function renameGroup(oldName, newName) {
 }
 
 // --- Init ---
-// Connect on service worker load (extension install/update/reload)
+// connect() already guards against duplicate connections, safe to call from multiple events
 connect();
-
-// Also connect on Chrome startup (service worker may not auto-load after restart)
-chrome.runtime.onStartup.addListener(() => {
-  if (!port) connect();
-});
-
-// And on extension install/update
-chrome.runtime.onInstalled.addListener(() => {
-  if (!port) connect();
-});
+chrome.runtime.onStartup.addListener(connect);
+chrome.runtime.onInstalled.addListener(connect);
