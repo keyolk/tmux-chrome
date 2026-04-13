@@ -60,7 +60,7 @@ async function handleMessage(msg) {
     case "list_groups":
       return listGroups();
     case "add_tab":
-      return addTab(msg.name, msg.url);
+      return addTab(msg.name, msg.url, msg.active);
     case "move_tab":
       return moveTab(msg.name);
     case "remove_tab":
@@ -143,12 +143,12 @@ async function listGroups() {
   return result;
 }
 
-async function addTab(groupName, url) {
+async function addTab(groupName, url, active = false) {
   let group = await findGroupByTitle(groupName);
 
   // Create group if it doesn't exist
   if (!group) {
-    const tab = await chrome.tabs.create({ url, active: false });
+    const tab = await chrome.tabs.create({ url, active });
     const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
     await chrome.tabGroups.update(groupId, {
       title: groupName,
@@ -159,7 +159,7 @@ async function addTab(groupName, url) {
   }
 
   // Add tab to existing group
-  const tab = await chrome.tabs.create({ url, active: false });
+  const tab = await chrome.tabs.create({ url, active });
   await chrome.tabs.group({ tabIds: [tab.id], groupId: group.id });
   await collapseAllExcept(group.id);
   return { group_id: group.id, tab_id: tab.id, created_group: false };

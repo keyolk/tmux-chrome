@@ -63,6 +63,7 @@ else
 # tmux-chrome tab group bridge
 set-hook -g after-select-window 'run-shell -b "~/.local/bin/tmux-chrome switch"'
 set-hook -g after-rename-window 'run-shell -b "~/.local/bin/tmux-chrome rename"'
+set-option -g @extrakto_open_tool "~/.local/bin/tmux-chrome open"
 HOOKS
   echo "[5/5] Added tmux hooks to ~/.tmux.conf"
 fi

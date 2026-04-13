@@ -110,6 +110,30 @@ function cmd_delete {
   fi
 }
 
+function cmd_open {
+  local url="$1"
+  if [[ -z "$url" ]]; then
+    echo "Usage: tmux-chrome open <url>" >&2
+    return 1
+  fi
+
+  local group_name
+  group_name=$(tmux display-message -p '#W')
+  local id
+  id=$(request_id)
+  local response
+  response=$(chrome_cmd "{\"type\":\"add_tab\",\"name\":\"$group_name\",\"url\":\"$url\",\"active\":true,\"id\":\"$id\"}")
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" == "true" ]]; then
+    echo "Opened in '$group_name': $url"
+  else
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+}
+
 function cmd_add {
   local url="$1"
   if [[ -z "$url" ]]; then
@@ -280,6 +304,7 @@ function main {
     switch)  cmd_switch "$@" ;;
     list)    cmd_list ;;
     delete)  cmd_delete "$@" ;;
+    open)    cmd_open "$@" ;;
     add)     cmd_add "$@" ;;
     move)    cmd_move ;;
     remove)  cmd_remove ;;
@@ -287,12 +312,13 @@ function main {
     tabs)    cmd_tabs "$@" ;;
     rename)  cmd_rename ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|add|move|remove|grab|tabs|rename}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|grab|tabs|rename}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
       echo "  list            List all tab groups"
       echo "  delete          Delete tab group for current window"
+      echo "  open <url>      Open URL directly into current window's tab group"
       echo "  add <url>       Add URL to current window's tab group"
       echo "  move            Move Chrome's active tab to current window's group"
       echo "  remove          Remove Chrome's active tab from its group"
