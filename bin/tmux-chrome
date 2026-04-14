@@ -98,7 +98,7 @@ function flash_chrome {
   echo "$window_name" > "$FLASH_DEBOUNCE_FILE"
 
   (
-    sleep 0.5
+    sleep 1
     # If window changed since we scheduled, skip flash
     [[ -f "$FLASH_DEBOUNCE_FILE" ]] || exit 0
     current=$(cat "$FLASH_DEBOUNCE_FILE" 2>/dev/null)
