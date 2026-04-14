@@ -414,19 +414,21 @@ function cmd_sync {
 }
 
 function cmd_picker {
-  # Unified fzf picker: apps + all tab group tabs
+  # Unified fzf picker: apps + current window's tab group tabs
   local apps="app\tChrome\napp\tSlack"
   local tabs_section=""
+  local group_name
+  group_name=$(tmux display-message -p '#W' 2>/dev/null)
 
-  if [[ -S "$CHROME_BRIDGE_SOCKET" ]]; then
+  if [[ -S "$CHROME_BRIDGE_SOCKET" ]] && [[ -n "$group_name" ]]; then
     local id
     id=$(request_id)
     local response
-    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"all\":true,\"id\":\"$id\"}" 2>/dev/null)
+    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"name\":\"$group_name\",\"id\":\"$id\"}" 2>/dev/null)
     local success
     success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
     if [[ "$success" == "true" ]]; then
-      tabs_section=$(echo "$response" | jq -r '.data[] | "tab:\(.id)\t[\(.group_title)] \(.title)  \(.url)"')
+      tabs_section=$(echo "$response" | jq -r '.data[] | "tab:\(.id)\t\(.title)  \(.url)"')
     fi
   fi
 
