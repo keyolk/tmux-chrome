@@ -44,39 +44,18 @@ function request_id {
 CHROME_EXTENSION_ID="${TMUX_CHROME_EXT_ID:-dplackkpcodnphbdcmfppmcbhkonlecg}"
 
 function cmd_reload {
-  # Toggle extension off→on via AppleScript to restart service worker + bridge
   echo "Reloading extension..."
-  osascript <<APPLESCRIPT
-tell application "Google Chrome"
-    open location "chrome://extensions/?id=$CHROME_EXTENSION_ID"
-    delay 0.5
-    tell active tab of front window
-        execute javascript "
-            const mgr = document.querySelector('extensions-manager');
-            const dv = mgr.shadowRoot.querySelector('extensions-detail-view');
-            if (dv) { dv.shadowRoot.querySelector('#enable-toggle').click(); }
-            'off';
-        "
-    end tell
-    delay 0.5
-    tell active tab of front window
-        execute javascript "
-            const mgr = document.querySelector('extensions-manager');
-            const dv = mgr.shadowRoot.querySelector('extensions-detail-view');
-            if (dv) { dv.shadowRoot.querySelector('#enable-toggle').click(); }
-            'on';
-        "
-    end tell
-    delay 0.3
-    tell active tab of front window
-        execute javascript "window.close();"
-    end tell
-end tell
-APPLESCRIPT
 
-  # Wait for socket
+  # Navigate to extension's reload.html which calls chrome.runtime.reload()
+  osascript -e "
+    tell application \"Google Chrome\"
+      open location \"chrome-extension://$CHROME_EXTENSION_ID/reload.html\"
+    end tell
+  " 2>/dev/null
+
+  # Wait for socket to come back
   local tries=0
-  while [[ ! -S "$CHROME_BRIDGE_SOCKET" ]] && [[ $tries -lt 10 ]]; do
+  while [[ ! -S "$CHROME_BRIDGE_SOCKET" ]] && [[ $tries -lt 15 ]]; do
     sleep 0.5
     ((tries++))
   done
