@@ -372,6 +372,24 @@ function cmd_tabs {
   echo "Focused tab: $(echo "$selected" | cut -f2)"
 }
 
+function cmd_clean {
+  local id
+  id=$(request_id)
+  local response
+  response=$(chrome_cmd "{\"type\":\"clean_tabs\",\"id\":\"$id\"}")
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" == "true" ]]; then
+    local closed
+    closed=$(echo "$response" | jq -r '.data.closed // 0')
+    echo "Closed $closed ungrouped tab(s)"
+  else
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+}
+
 function main {
   local subcmd="${1:-}"
   shift 2>/dev/null || true
@@ -389,8 +407,9 @@ function main {
     tabs)    cmd_tabs "$@" ;;
     rename)  cmd_rename ;;
     reload)  cmd_reload ;;
+    clean)   cmd_clean ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|grab|tabs|rename|reload|focus}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|grab|tabs|rename|reload|focus|clean}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -404,6 +423,7 @@ function main {
       echo "  grab            Extract URLs from panes → fzf → add to tab group"
       echo "  tabs [--all]    Browse tabs in group via fzf → focus selected"
       echo "  reload          Restart Chrome extension and reconnect bridge"
+      echo "  clean           Close all tabs not belonging to any tab group"
       return 1
       ;;
   esac

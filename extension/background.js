@@ -100,6 +100,8 @@ async function handleMessage(msg) {
       return focusTab(msg.tab_id);
     case "rename_group":
       return renameGroup(msg.old_name, msg.new_name);
+    case "clean_tabs":
+      return cleanTabs();
     default:
       throw new Error(`Unknown message type: ${msg.type}`);
   }
@@ -287,6 +289,18 @@ async function renameGroup(oldName, newName) {
 
   await chrome.tabGroups.update(group.id, { title: newName });
   return { group_id: group.id, old_name: oldName, new_name: newName };
+}
+
+async function cleanTabs() {
+  const allTabs = await chrome.tabs.query({});
+  const ungrouped = allTabs.filter(
+    (t) => t.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE
+  );
+  if (ungrouped.length === 0) return { closed: 0 };
+
+  const tabIds = ungrouped.map((t) => t.id);
+  await chrome.tabs.remove(tabIds);
+  return { closed: tabIds.length };
 }
 
 // --- Init ---
