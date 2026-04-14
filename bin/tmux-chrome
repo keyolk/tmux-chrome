@@ -373,6 +373,46 @@ function cmd_tabs {
   echo "Focused tab: $(echo "$selected" | cut -f2)"
 }
 
+function cmd_sync {
+  # Remove Chrome tab groups that no longer have a matching tmux window
+  local tmux_windows
+  tmux_windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null)
+  if [[ -z "$tmux_windows" ]]; then
+    echo "Error: not in a tmux session" >&2
+    return 1
+  fi
+
+  local id
+  id=$(request_id)
+  local response
+  response=$(chrome_cmd "{\"type\":\"list_groups\",\"id\":\"$id\"}")
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" != "true" ]]; then
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+
+  local removed=0
+  while IFS= read -r group_title; do
+    [[ -z "$group_title" ]] && continue
+    if ! echo "$tmux_windows" | grep -qxF "$group_title"; then
+      local del_id
+      del_id=$(request_id)
+      chrome_cmd "{\"type\":\"delete_group\",\"name\":\"$group_title\",\"id\":\"$del_id\"}" > /dev/null 2>&1
+      echo "Removed orphan group: $group_title"
+      ((removed++))
+    fi
+  done < <(echo "$response" | jq -r '.data[].title')
+
+  if [[ $removed -eq 0 ]]; then
+    echo "No orphan tab groups found"
+  else
+    echo "Removed $removed orphan group(s)"
+  fi
+}
+
 function cmd_clean {
   local id
   id=$(request_id)
@@ -409,8 +449,9 @@ function main {
     rename)  cmd_rename ;;
     reload)  cmd_reload ;;
     clean)   cmd_clean ;;
+    sync)    cmd_sync ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|grab|tabs|rename|reload|focus|clean}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|grab|tabs|rename|reload|focus|clean|sync}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -425,6 +466,7 @@ function main {
       echo "  tabs [--all]    Browse tabs in group via fzf → focus selected"
       echo "  reload          Restart Chrome extension and reconnect bridge"
       echo "  clean           Close all tabs not belonging to any tab group"
+      echo "  sync            Remove tab groups with no matching tmux window"
       return 1
       ;;
   esac
