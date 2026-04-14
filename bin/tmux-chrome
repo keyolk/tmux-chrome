@@ -89,6 +89,18 @@ APPLESCRIPT
   fi
 }
 
+function flash_chrome {
+  # Briefly focus Chrome to force tab group repaint, then return to terminal
+  osascript -e '
+    tell application "System Events"
+      set frontApp to name of first application process whose frontmost is true
+    end tell
+    tell application "Google Chrome" to activate
+    delay 0.05
+    tell application frontApp to activate
+  ' 2>/dev/null &
+}
+
 function cmd_switch {
   local window_name="${1:-$(tmux display-message -p '#W')}"
   # Track current group name for rename detection
@@ -97,7 +109,14 @@ function cmd_switch {
   [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 0
   local id
   id=$(request_id)
-  chrome_cmd "{\"type\":\"switch_window\",\"window_name\":\"$window_name\",\"id\":\"$id\"}" > /dev/null 2>&1 || true
+  local response
+  response=$(chrome_cmd "{\"type\":\"switch_window\",\"window_name\":\"$window_name\",\"id\":\"$id\"}" 2>/dev/null) || true
+  # Flash Chrome to repaint tab groups if a group was matched
+  local matched
+  matched=$(echo "$response" | jq -r '.data.matched // false' 2>/dev/null)
+  if [[ "$matched" == "true" ]]; then
+    flash_chrome
+  fi
 }
 
 function cmd_rename {
