@@ -415,7 +415,7 @@ function cmd_sync {
 
 function cmd_picker {
   # Unified fzf picker: apps + current window's tab group tabs
-  local apps="app\tChrome\napp\tSlack"
+  local apps="app\t[app] Chrome\napp\t[app] Slack"
   local tabs_section=""
   local group_name
   group_name=$(tmux display-message -p '#W' 2>/dev/null)
@@ -428,7 +428,7 @@ function cmd_picker {
     local success
     success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
     if [[ "$success" == "true" ]]; then
-      tabs_section=$(echo "$response" | jq -r '.data[] | "tab:\(.id)\t\(.title)  \(.url)"')
+      tabs_section=$(echo "$response" | jq -r '.data[] | "tab:\(.id)\t[tab] \(.title)  \(.url)"')
     fi
   fi
 
