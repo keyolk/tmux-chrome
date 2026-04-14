@@ -90,12 +90,20 @@ APPLESCRIPT
 }
 
 function flash_chrome {
-  # Briefly focus Chrome to force tab group repaint, then return to terminal
+  # Briefly focus a normal Chrome window (not DevTools) to force tab repaint
   osascript -e '
     tell application "System Events"
       set frontApp to name of first application process whose frontmost is true
     end tell
-    tell application "Google Chrome" to activate
+    tell application "Google Chrome"
+      repeat with w in windows
+        if title of w does not contain "DevTools" then
+          set index of w to 1
+          exit repeat
+        end if
+      end repeat
+      activate
+    end tell
     delay 0.05
     tell application frontApp to activate
   ' 2>/dev/null &
