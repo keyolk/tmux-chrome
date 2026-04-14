@@ -413,6 +413,57 @@ function cmd_sync {
   fi
 }
 
+function cmd_picker {
+  # Unified fzf picker: apps + all tab group tabs
+  local apps="app\tChrome\napp\tSlack"
+  local tabs_section=""
+
+  if [[ -S "$CHROME_BRIDGE_SOCKET" ]]; then
+    local id
+    id=$(request_id)
+    local response
+    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"all\":true,\"id\":\"$id\"}" 2>/dev/null)
+    local success
+    success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+    if [[ "$success" == "true" ]]; then
+      tabs_section=$(echo "$response" | jq -r '.data[] | "tab:\(.id)\t[\(.group_title)] \(.title)  \(.url)"')
+    fi
+  fi
+
+  local fzf_input
+  fzf_input=$(printf "%b" "$apps")
+  if [[ -n "$tabs_section" ]]; then
+    fzf_input="$fzf_input"$'\n'"$tabs_section"
+  fi
+
+  local selected
+  selected=$(echo "$fzf_input" | fzf \
+    --prompt="focus> " \
+    --delimiter=$'\t' \
+    --with-nth=2 \
+    --preview='echo {2}' \
+    --preview-window=down:1:wrap)
+
+  [[ -z "$selected" ]] && return 0
+
+  local type_field
+  type_field=$(echo "$selected" | cut -f1)
+
+  case "$type_field" in
+    app)
+      local app_name
+      app_name=$(echo "$selected" | cut -f2)
+      cmd_focus "$app_name"
+      ;;
+    tab:*)
+      local tab_id="${type_field#tab:}"
+      local focus_id
+      focus_id=$(request_id)
+      chrome_cmd "{\"type\":\"focus_tab\",\"tab_id\":$tab_id,\"id\":\"$focus_id\"}" > /dev/null
+      ;;
+  esac
+}
+
 function cmd_clean {
   local id
   id=$(request_id)
@@ -450,8 +501,9 @@ function main {
     reload)  cmd_reload ;;
     clean)   cmd_clean ;;
     sync)    cmd_sync ;;
+    picker)  cmd_picker ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|grab|tabs|rename|reload|focus|clean|sync}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|grab|tabs|rename|reload|focus|clean|sync|picker}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
