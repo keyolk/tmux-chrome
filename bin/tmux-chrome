@@ -454,7 +454,7 @@ function cmd_picker {
   case "$type_field" in
     app)
       local app_name
-      app_name=$(echo "$selected" | cut -f2)
+      app_name=$(echo "$selected" | cut -f2 | sed 's/^\[app\] //')
       cmd_focus "$app_name"
       ;;
     tab:*)
