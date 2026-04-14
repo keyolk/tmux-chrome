@@ -89,24 +89,38 @@ APPLESCRIPT
   fi
 }
 
+FLASH_DEBOUNCE_FILE="/tmp/tmux-chrome-flash"
+
 function flash_chrome {
-  # Briefly focus a normal Chrome window (not DevTools) to force tab repaint
-  osascript -e '
-    tell application "System Events"
-      set frontApp to name of first application process whose frontmost is true
-    end tell
-    tell application "Google Chrome"
-      repeat with w in windows
-        if title of w does not contain "DevTools" then
-          set index of w to 1
-          exit repeat
-        end if
-      end repeat
-      activate
-    end tell
-    delay 0.05
-    tell application frontApp to activate
-  ' 2>/dev/null &
+  local window_name="$1"
+
+  # Write current target; a later check will verify we're still here
+  echo "$window_name" > "$FLASH_DEBOUNCE_FILE"
+
+  (
+    sleep 0.5
+    # If window changed since we scheduled, skip flash
+    [[ -f "$FLASH_DEBOUNCE_FILE" ]] || exit 0
+    current=$(cat "$FLASH_DEBOUNCE_FILE" 2>/dev/null)
+    [[ "$current" == "$window_name" ]] || exit 0
+
+    osascript -e '
+      tell application "System Events"
+        set frontApp to name of first application process whose frontmost is true
+      end tell
+      tell application "Google Chrome"
+        repeat with w in windows
+          if title of w does not contain "DevTools" then
+            set index of w to 1
+            exit repeat
+          end if
+        end repeat
+        activate
+      end tell
+      delay 0.05
+      tell application frontApp to activate
+    ' 2>/dev/null
+  ) &
 }
 
 function cmd_switch {
