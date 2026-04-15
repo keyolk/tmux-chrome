@@ -41,6 +41,10 @@ function request_id {
   echo "req_$(date +%s%N | cut -c1-13)"
 }
 
+function json_escape {
+  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().rstrip("\n")))'
+}
+
 CHROME_EXTENSION_ID="${TMUX_CHROME_EXT_ID:-dplackkpcodnphbdcmfppmcbhkonlecg}"
 
 function cmd_reload {
@@ -76,7 +80,9 @@ function cmd_switch {
   [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 0
   local id
   id=$(request_id)
-  chrome_cmd "{\"type\":\"switch_window\",\"window_name\":\"$window_name\",\"id\":\"$id\"}" > /dev/null 2>&1 || true
+  local window_json
+  window_json=$(printf '%s' "$window_name" | json_escape)
+  chrome_cmd "{\"type\":\"switch_window\",\"window_name\":${window_json},\"id\":\"$id\"}" > /dev/null 2>&1 || true
 }
 
 function cmd_rename {
@@ -96,7 +102,10 @@ function cmd_rename {
   [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 0
   local id
   id=$(request_id)
-  chrome_cmd "{\"type\":\"rename_group\",\"old_name\":\"$old_name\",\"new_name\":\"$new_name\",\"id\":\"$id\"}" > /dev/null 2>&1 || true
+  local old_json new_json
+  old_json=$(printf '%s' "$old_name" | json_escape)
+  new_json=$(printf '%s' "$new_name" | json_escape)
+  chrome_cmd "{\"type\":\"rename_group\",\"old_name\":${old_json},\"new_name\":${new_json},\"id\":\"$id\"}" > /dev/null 2>&1 || true
 }
 
 function cmd_list {
@@ -125,7 +134,9 @@ function cmd_delete {
   local id
   id=$(request_id)
   local response
-  response=$(chrome_cmd "{\"type\":\"delete_group\",\"name\":\"$group_name\",\"id\":\"$id\"}")
+  local group_json
+  group_json=$(printf '%s' "$group_name" | json_escape)
+  response=$(chrome_cmd "{\"type\":\"delete_group\",\"name\":${group_json},\"id\":\"$id\"}")
 
   local success
   success=$(echo "$response" | jq -r '.success // false')
@@ -141,6 +152,8 @@ function cmd_focus {
   local app="${1:-chrome}"
   case "$app" in
     chrome)  osascript -e 'tell application "Google Chrome" to activate' 2>/dev/null ;;
+    discord)  osascript -e 'tell application "Discord" to activate' 2>/dev/null ;;
+    zoom)  osascript -e 'tell application "Zoom" to activate' 2>/dev/null ;;
     slack)   osascript -e 'tell application "Slack" to activate' 2>/dev/null ;;
     *)       osascript -e "tell application \"$app\" to activate" 2>/dev/null ;;
   esac
@@ -158,7 +171,10 @@ function cmd_open {
   local id
   id=$(request_id)
   local response
-  response=$(chrome_cmd "{\"type\":\"add_tab\",\"name\":\"$group_name\",\"url\":\"$url\",\"active\":true,\"id\":\"$id\"}")
+  local group_json url_json
+  group_json=$(printf '%s' "$group_name" | json_escape)
+  url_json=$(printf '%s' "$url" | json_escape)
+  response=$(chrome_cmd "{\"type\":\"add_tab\",\"name\":${group_json},\"url\":${url_json},\"active\":true,\"id\":\"$id\"}")
 
   local success
   success=$(echo "$response" | jq -r '.success // false')
@@ -181,7 +197,10 @@ function cmd_add {
   local id
   id=$(request_id)
   local response
-  response=$(chrome_cmd "{\"type\":\"add_tab\",\"name\":\"$group_name\",\"url\":\"$url\",\"id\":\"$id\"}")
+  local group_json url_json
+  group_json=$(printf '%s' "$group_name" | json_escape)
+  url_json=$(printf '%s' "$url" | json_escape)
+  response=$(chrome_cmd "{\"type\":\"add_tab\",\"name\":${group_json},\"url\":${url_json},\"id\":\"$id\"}")
 
   local success
   success=$(echo "$response" | jq -r '.success // false')
@@ -205,7 +224,9 @@ function cmd_move {
   local id
   id=$(request_id)
   local response
-  response=$(chrome_cmd "{\"type\":\"move_tab\",\"name\":\"$group_name\",\"id\":\"$id\"}")
+  local group_json
+  group_json=$(printf '%s' "$group_name" | json_escape)
+  response=$(chrome_cmd "{\"type\":\"move_tab\",\"name\":${group_json},\"id\":\"$id\"}")
 
   local success
   success=$(echo "$response" | jq -r '.success // false')
@@ -231,6 +252,86 @@ function cmd_remove {
     echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
     return 1
   fi
+}
+
+function cmd_export_group {
+  local group_name="${1:-$(tmux display-message -p '#W' 2>/dev/null)}"
+  if [[ -z "$group_name" ]]; then
+    echo "Usage: tmux-chrome export-group <group_name>" >&2
+    return 1
+  fi
+
+  local id
+  id=$(request_id)
+  local response
+  local group_json
+  group_json=$(printf '%s' "$group_name" | json_escape)
+  response=$(chrome_cmd "{\"type\":\"get_tabs\",\"name\":${group_json},\"id\":\"$id\"}" 2>/dev/null)
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+  if [[ "$success" != "true" ]]; then
+    echo "{}"
+    return 0
+  fi
+
+  echo "$response" | jq -c --arg group "$group_name" '{group: $group, tabs: [.data[] | {url, title}]}'
+}
+
+function cmd_clear_group {
+  local group_name="${1:-$(tmux display-message -p '#W' 2>/dev/null)}"
+  if [[ -z "$group_name" ]]; then
+    echo "Usage: tmux-chrome clear-group <group_name>" >&2
+    return 1
+  fi
+
+  local id
+  id=$(request_id)
+  local response
+  local group_json
+  group_json=$(printf '%s' "$group_name" | json_escape)
+  response=$(chrome_cmd "{\"type\":\"delete_group\",\"name\":${group_json},\"id\":\"$id\"}" 2>/dev/null) || true
+  local success
+  success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+  if [[ "$success" == "true" ]]; then
+    echo "Cleared group: $group_name"
+  else
+    # deleting a missing group is fine for restore flows
+    echo "Group missing or already clear: $group_name" >&2
+  fi
+}
+
+function cmd_import_group {
+  local group_name="$1"
+  local source="${2:--}"
+  if [[ -z "$group_name" ]]; then
+    echo "Usage: tmux-chrome import-group <group_name> [json-file|-]" >&2
+    return 1
+  fi
+
+  local payload
+  if [[ "$source" == "-" ]]; then
+    payload=$(cat)
+  else
+    payload=$(cat "$source")
+  fi
+
+  [[ -z "$payload" ]] && return 0
+
+  # delete existing group first (best effort)
+  cmd_clear_group "$group_name" >/dev/null 2>&1 || true
+
+  # restore tabs in saved order
+  local group_json
+  group_json=$(printf '%s' "$group_name" | json_escape)
+  echo "$payload" | jq -r '.tabs[]?.url' | while IFS= read -r url; do
+    [[ -z "$url" ]] && continue
+    local id
+    id=$(request_id)
+    local url_json
+    url_json=$(printf '%s' "$url" | json_escape)
+    chrome_cmd "{\"type\":\"add_tab\",\"name\":${group_json},\"url\":${url_json},\"active\":false,\"id\":\"$id\"}" > /dev/null 2>&1 || true
+  done
 }
 
 function cmd_grab {
@@ -263,11 +364,15 @@ function cmd_grab {
   fi
 
   local count=0
+  local group_json
+  group_json=$(printf '%s' "$group_name" | json_escape)
   while IFS= read -r url; do
     if [[ -n "$url" ]]; then
       local id
       id=$(request_id)
-      chrome_cmd "{\"type\":\"add_tab\",\"name\":\"$group_name\",\"url\":\"$url\",\"id\":\"$id\"}" > /dev/null
+      local url_json
+      url_json=$(printf '%s' "$url" | json_escape)
+      chrome_cmd "{\"type\":\"add_tab\",\"name\":${group_json},\"url\":${url_json},\"id\":\"$id\"}" > /dev/null
       ((count++))
     fi
   done <<< "$selected"
@@ -287,11 +392,13 @@ function cmd_tabs {
   local id
   id=$(request_id)
   local response
+  local group_json
+  group_json=$(printf '%s' "$group_name" | json_escape)
 
   if [[ -n "$all_flag" ]]; then
     response=$(chrome_cmd "{\"type\":\"get_tabs\",\"all\":true,\"id\":\"$id\"}")
   else
-    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"name\":\"$group_name\",\"id\":\"$id\"}")
+    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"name\":${group_json},\"id\":\"$id\"}")
   fi
 
   local success
@@ -359,7 +466,9 @@ function cmd_sync {
     if ! echo "$tmux_windows" | grep -qxF "$group_title"; then
       local del_id
       del_id=$(request_id)
-      chrome_cmd "{\"type\":\"delete_group\",\"name\":\"$group_title\",\"id\":\"$del_id\"}" > /dev/null 2>&1
+      local group_json
+      group_json=$(printf '%s' "$group_title" | json_escape)
+      chrome_cmd "{\"type\":\"delete_group\",\"name\":${group_json},\"id\":\"$del_id\"}" > /dev/null 2>&1
       echo "Removed orphan group: $group_title"
       ((removed++))
     fi
@@ -374,7 +483,7 @@ function cmd_sync {
 
 function cmd_picker {
   # Unified fzf picker: apps + current window's tab group tabs
-  local apps="app\t[app] Chrome\napp\t[app] Slack"
+  local apps="app\t[app] Chrome\napp\t[app] Slack\napp\t[app] Zoom\napp\t[app] Discord"
   local tabs_section=""
   local group_name
   group_name=$(tmux display-message -p '#W' 2>/dev/null)
@@ -383,7 +492,9 @@ function cmd_picker {
     local id
     id=$(request_id)
     local response
-    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"name\":\"$group_name\",\"id\":\"$id\"}" 2>/dev/null)
+    local group_json
+    group_json=$(printf '%s' "$group_name" | json_escape)
+    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"name\":${group_json},\"id\":\"$id\"}" 2>/dev/null)
     local success
     success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
     if [[ "$success" == "true" ]]; then
@@ -456,6 +567,9 @@ function main {
     add)     cmd_add "$@" ;;
     move)    cmd_move ;;
     remove)  cmd_remove ;;
+    export-group) cmd_export_group "$@" ;;
+    import-group) cmd_import_group "$@" ;;
+    clear-group) cmd_clear_group "$@" ;;
     grab)    cmd_grab ;;
     tabs)    cmd_tabs "$@" ;;
     rename)  cmd_rename ;;
@@ -464,7 +578,7 @@ function main {
     sync)    cmd_sync ;;
     picker)  cmd_picker ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|grab|tabs|rename|reload|focus|clean|sync|picker}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|picker}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -475,6 +589,9 @@ function main {
       echo "  add <url>       Add URL to current window's tab group"
       echo "  move            Move Chrome's active tab to current window's group"
       echo "  remove          Remove Chrome's active tab from its group"
+      echo "  export-group    Export one tab group as JSON"
+      echo "  import-group    Import one tab group from JSON"
+      echo "  clear-group     Delete one named tab group"
       echo "  grab            Extract URLs from panes → fzf → add to tab group"
       echo "  tabs [--all]    Browse tabs in group via fzf → focus selected"
       echo "  reload          Restart Chrome extension and reconnect bridge"

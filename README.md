@@ -57,19 +57,24 @@ Name your tmux windows (`Ctrl-A n` → type name). Create Chrome tab groups with
 
 ```bash
 # Tab group operations
-tmux-chrome switch          # Switch to group matching current tmux window
-tmux-chrome list            # List all tab groups
-tmux-chrome delete          # Delete current window's tab group
+tmux-chrome switch               # Switch to group matching current tmux window
+tmux-chrome list                 # List all tab groups
+tmux-chrome delete               # Delete current window's tab group
+tmux-chrome export-group <name>  # Export one group as JSON
+tmux-chrome import-group <name>  # Import one group from JSON stdin/file
 
 # Tab management
-tmux-chrome add <url>       # Add URL to current window's group (auto-creates group)
-tmux-chrome move            # Move Chrome's active tab into current window's group
-tmux-chrome remove          # Remove Chrome's active tab from its group
+tmux-chrome add <url>            # Add URL to current window's group (auto-creates group)
+tmux-chrome move                 # Move Chrome's active tab into current window's group
+tmux-chrome remove               # Remove Chrome's active tab from its group
+tmux-chrome clean                # Close all tabs that aren't in any tab group
+tmux-chrome sync                 # Remove tab groups with no matching tmux window
 
 # Interactive
-tmux-chrome grab            # Extract URLs from tmux panes → fzf multi-select → add to group
-tmux-chrome tabs            # Browse current group's tabs via fzf → focus selected
-tmux-chrome tabs --all      # Browse all tabs across all groups
+tmux-chrome grab                 # Extract URLs from tmux panes → fzf multi-select → add to group
+tmux-chrome tabs                 # Browse current group's tabs via fzf → focus selected
+tmux-chrome tabs --all           # Browse all tabs across all groups
+tmux-chrome picker               # Unified picker for apps + current group's tabs
 ```
 
 ### From tmux.sh
@@ -83,6 +88,58 @@ function chrome_dispatch {
 ```
 
 Then call as `tmux.sh chrome grab`, `tmux.sh chrome tabs`, etc.
+
+### Combined tmux + Chrome save/load
+
+If you already use `tmux.sh save` / `tmux.sh load`, Chrome tab groups can be persisted alongside each tmux window.
+
+How it works:
+- tmux window name is the key
+- matching Chrome tab group title is snapshotted into the same layout JSON
+- on `tmux.sh load`, only the Chrome groups for the restored windows are recreated
+- unrelated Chrome groups are left untouched
+
+Saved per window:
+- window name/layout/panes (existing tmux behavior)
+- matching Chrome group tabs as an ordered list of URLs
+
+Not saved:
+- Chrome tab IDs / group IDs
+- active tab
+- collapsed state
+- pinned state
+
+Notes:
+- duplicate tmux window names are ambiguous for Chrome mapping; Chrome snapshot is skipped for duplicates
+- if the Chrome bridge is unavailable, tmux save/load still works; Chrome snapshot/restore is skipped gracefully
+- restore recreates the saved URLs in order for that window's group
+
+Example flow:
+```bash
+# create tmux windows: harness, civiz
+# create matching Chrome groups: harness, civiz
+
+tmux.sh save my-session
+# later...
+tmux.sh load
+```
+
+The saved layout file under `~/.config/tmux/layouts/*.json` will include an optional `chrome` block per window:
+
+```json
+{
+  "name": "harness",
+  "layout": "...",
+  "panes": [...],
+  "chrome": {
+    "group": "harness",
+    "tabs": [
+      { "url": "https://github.com/...", "title": "..." },
+      { "url": "https://grafana...", "title": "..." }
+    ]
+  }
+}
+```
 
 ## Design decisions
 
