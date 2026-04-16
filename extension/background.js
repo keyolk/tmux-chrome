@@ -3,6 +3,7 @@
 // RULE: Never call chrome.windows.update({focused: true}) — terminal must keep focus.
 
 const NATIVE_HOST = "com.tmux.chrome.bridge";
+const RESERVED_GROUP_TITLE = "native";
 let port = null;
 let reconnectTimer = null;
 let reconnectDelay = 5000; // start at 5s
@@ -137,6 +138,19 @@ async function switchWindow(windowName) {
   return { matched: true, group_id: group.id };
 }
 
+async function ensureReservedNativeGroup() {
+  let group = await findGroupByTitle(RESERVED_GROUP_TITLE);
+  if (group) return group;
+
+  const tab = await chrome.tabs.create({ active: false });
+  const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+  await chrome.tabGroups.update(groupId, {
+    title: RESERVED_GROUP_TITLE,
+    collapsed: true,
+  });
+  return chrome.tabGroups.get(groupId);
+}
+
 async function createGroup(name) {
   // Create a blank tab and group it
   const tab = await chrome.tabs.create({ active: false });
@@ -147,6 +161,10 @@ async function createGroup(name) {
 }
 
 async function deleteGroup(name) {
+  if (name && name.toLowerCase() === RESERVED_GROUP_TITLE) {
+    throw new Error(`Tab group "${RESERVED_GROUP_TITLE}" is reserved and cannot be deleted`);
+  }
+
   const group = await findGroupByTitle(name);
   if (!group) throw new Error(`Tab group "${name}" not found`);
 
@@ -292,15 +310,27 @@ async function renameGroup(oldName, newName) {
 }
 
 async function cleanTabs() {
+  const nativeGroup = await ensureReservedNativeGroup();
   const allTabs = await chrome.tabs.query({});
   const ungrouped = allTabs.filter(
     (t) => t.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE
   );
-  if (ungrouped.length === 0) return { closed: 0 };
 
-  const tabIds = ungrouped.map((t) => t.id);
-  await chrome.tabs.remove(tabIds);
-  return { closed: tabIds.length };
+  if (ungrouped.length === 0) return { moved: 0, group: RESERVED_GROUP_TITLE };
+
+  const tabIds = ungrouped
+    .map((t) => t.id)
+    .filter((id) => id !== undefined && id !== null);
+
+  if (tabIds.length > 0) {
+    await chrome.tabs.group({ tabIds, groupId: nativeGroup.id });
+    await chrome.tabGroups.update(nativeGroup.id, {
+      title: RESERVED_GROUP_TITLE,
+      collapsed: true,
+    });
+  }
+
+  return { moved: tabIds.length, group: RESERVED_GROUP_TITLE };
 }
 
 // --- Init ---
