@@ -2,6 +2,9 @@
 // Communicates with native messaging host to sync tab groups with tmux windows.
 // RULE: Never call chrome.windows.update({focused: true}) — terminal must keep focus.
 
+const BUILD_MARKER = "tmux-chrome-bridge:active-group-2026-04-28";
+console.log("[tmux-chrome] background loaded:", BUILD_MARKER);
+
 const NATIVE_HOST = "com.tmux.chrome.bridge";
 const RESERVED_GROUP_TITLE = "native";
 let port = null;
@@ -9,6 +12,40 @@ let reconnectTimer = null;
 let reconnectDelay = 5000; // start at 5s
 const MAX_RECONNECT_DELAY = 300000; // cap at 5 minutes
 let lastConnectTime = 0;
+
+// Per-group memory of the last active tab id, so switching groups restores
+// the tab the user was last on inside that group instead of always jumping
+// to the first tab.
+const lastActiveTabByGroup = new Map();
+
+function rememberActiveTabForGroup(groupId, tabId) {
+  if (typeof groupId === "number" && groupId >= 0 && typeof tabId === "number") {
+    lastActiveTabByGroup.set(groupId, tabId);
+  }
+}
+
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    rememberActiveTabForGroup(tab.groupId, tabId);
+  } catch (_) {
+    // tab gone
+  }
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.groupId !== undefined && tab.active) {
+    rememberActiveTabForGroup(tab.groupId, tabId);
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  for (const [groupId, lastTabId] of lastActiveTabByGroup.entries()) {
+    if (lastTabId === tabId) {
+      lastActiveTabByGroup.delete(groupId);
+    }
+  }
+});
 
 function connect() {
   // Prevent multiple simultaneous connections
@@ -96,7 +133,7 @@ async function handleMessage(msg) {
     case "remove_tab":
       return removeTab();
     case "get_tabs":
-      return getTabs(msg.name, msg.all);
+      return getTabs(msg.name, msg.all, msg.active);
     case "focus_tab":
       return focusTab(msg.tab_id);
     case "rename_group":
@@ -109,10 +146,10 @@ async function handleMessage(msg) {
 }
 
 async function findGroupByTitle(title) {
+  if (typeof title !== "string" || title.length === 0) return undefined;
+  const lower = title.toLowerCase();
   const groups = await chrome.tabGroups.query({});
-  return groups.find(
-    (g) => g.title && g.title.toLowerCase() === title.toLowerCase()
-  );
+  return groups.find((g) => typeof g.title === "string" && g.title.toLowerCase() === lower);
 }
 
 async function collapseAllExcept(expandGroupId) {
@@ -129,13 +166,18 @@ async function switchWindow(windowName) {
 
   await collapseAllExcept(group.id);
 
-  // Set first tab in group as active — NO window focus
   const tabs = await chrome.tabs.query({ groupId: group.id });
-  if (tabs.length > 0) {
-    await chrome.tabs.update(tabs[0].id, { active: true });
+  if (tabs.length === 0) {
+    return { matched: true, group_id: group.id };
   }
 
-  return { matched: true, group_id: group.id };
+  const remembered = lastActiveTabByGroup.get(group.id);
+  const target = tabs.find((t) => t.id === remembered) ?? tabs[0];
+
+  await chrome.tabs.update(target.id, { active: true });
+  rememberActiveTabForGroup(group.id, target.id);
+
+  return { matched: true, group_id: group.id, tab_id: target.id };
 }
 
 async function ensureReservedNativeGroup() {
@@ -254,8 +296,38 @@ async function removeTab() {
   return { tab_id: activeTab.id };
 }
 
-async function getTabs(groupName, all) {
+async function getActiveGroup() {
+  // Prefer the currently focused (last-focused) Chrome window when available.
+  let chromeWindow = null;
+  try {
+    chromeWindow = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+  } catch (_) {
+    chromeWindow = null;
+  }
+
+  let activeTab = null;
+  if (chromeWindow) {
+    const [tab] = await chrome.tabs.query({ active: true, windowId: chromeWindow.id });
+    activeTab = tab ?? null;
+  }
+  if (!activeTab) {
+    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    activeTab = tab ?? null;
+  }
+  if (!activeTab) return null;
+
+  const groupId = activeTab.groupId;
+  if (groupId === undefined || groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) {
+    return null;
+  }
+
+  const group = await chrome.tabGroups.get(groupId);
+  return group ?? null;
+}
+
+async function getTabs(groupName, all, active) {
   let tabs;
+  let group = null;
   if (all) {
     // All tabs across all groups
     const groups = await chrome.tabGroups.query({});
@@ -272,18 +344,25 @@ async function getTabs(groupName, all) {
         });
       }
     }
-  } else {
-    const group = await findGroupByTitle(groupName);
-    if (!group) throw new Error(`Tab group "${groupName}" not found`);
-    const groupTabs = await chrome.tabs.query({ groupId: group.id });
-    tabs = groupTabs.map((t) => ({
-      id: t.id,
-      title: t.title,
-      url: t.url,
-      group_title: group.title,
-      group_id: group.id,
-    }));
+    return tabs;
   }
+
+  if (active) {
+    group = await getActiveGroup();
+    if (!group) throw new Error("No active tab group");
+  } else {
+    group = await findGroupByTitle(groupName);
+    if (!group) throw new Error(`Tab group "${groupName}" not found`);
+  }
+
+  const groupTabs = await chrome.tabs.query({ groupId: group.id });
+  tabs = groupTabs.map((t) => ({
+    id: t.id,
+    title: t.title,
+    url: t.url,
+    group_title: group.title || "(untitled)",
+    group_id: group.id,
+  }));
   return tabs;
 }
 

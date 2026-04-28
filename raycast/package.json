@@ -15,9 +15,15 @@
       "mode": "view"
     },
     {
-      "name": "browse-tabs",
-      "title": "Browse Tabs",
-      "description": "Browse all tabs across tab groups",
+      "name": "switch-tab",
+      "title": "Switch Tab",
+      "description": "Switch tabs in the tab group of the current tmux window",
+      "mode": "view"
+    },
+    {
+      "name": "switch-tmux-window",
+      "title": "Switch Tmux Window",
+      "description": "List and switch tmux windows across all sessions",
       "mode": "view"
     }
   ],

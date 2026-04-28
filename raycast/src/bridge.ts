@@ -83,6 +83,14 @@ export async function getAllTabs(): Promise<Tab[]> {
   return bridgeRequest<Tab[]>({ type: "get_tabs", all: true });
 }
 
+export async function getTabsForGroup(name: string): Promise<Tab[]> {
+  return bridgeRequest<Tab[]>({ type: "get_tabs", name });
+}
+
+export async function getActiveGroupTabs(): Promise<Tab[]> {
+  return bridgeRequest<Tab[]>({ type: "get_tabs", active: true });
+}
+
 export async function focusTab(tabId: number): Promise<void> {
   await bridgeRequest({ type: "focus_tab", tab_id: tabId });
 }

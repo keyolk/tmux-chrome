@@ -47,6 +47,96 @@ function json_escape {
 
 CHROME_EXTENSION_ID="${TMUX_CHROME_EXT_ID:-dplackkpcodnphbdcmfppmcbhkonlecg}"
 
+function current_frontmost_app {
+  osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || true
+}
+
+function ax_window_geometry {
+  /Users/gavin.jeong/.local/bin/ax-window-geometry "$@"
+}
+
+function is_known_terminal_app {
+  local app="$1"
+  case "$app" in
+    Ghostty|Alacritty|kitty|iTerm2|Terminal|WezTerm|Warp)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+function terminal_app_from_command {
+  local command="$1"
+  case "$command" in
+    *"/Ghostty.app/"*|*/ghostty|ghostty)
+      printf '%s\n' "Ghostty"
+      ;;
+    *"/Alacritty.app/"*|*/alacritty|alacritty)
+      printf '%s\n' "Alacritty"
+      ;;
+    *"/kitty.app/"*|*/kitty|kitty)
+      printf '%s\n' "kitty"
+      ;;
+    *"/iTerm.app/"*|*"/iTerm2.app/"*|*/iTerm2|iTerm2)
+      printf '%s\n' "iTerm2"
+      ;;
+    *"/Terminal.app/"*|*/Terminal|Terminal)
+      printf '%s\n' "Terminal"
+      ;;
+    *"/WezTerm.app/"*|*/wezterm-gui|wezterm-gui|WezTerm)
+      printf '%s\n' "WezTerm"
+      ;;
+    *"/Warp.app/"*|*/warp|warp|WarpTerminal)
+      printf '%s\n' "Warp"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+function detect_tmux_terminal_app {
+  local client_pid
+  client_pid=$(tmux display-message -p '#{client_pid}' 2>/dev/null || true)
+
+  if [[ "$client_pid" =~ ^[0-9]+$ ]]; then
+    local pid="$client_pid"
+    local depth=0
+
+    while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )) && (( depth < 20 )); do
+      local row
+      row=$(ps -o ppid=,args= -p "$pid" 2>/dev/null | sed 's/^[[:space:]]*//')
+      [[ -z "$row" ]] && break
+
+      local ppid="${row%% *}"
+      local args="${row#"$ppid"}"
+      args="${args# }"
+
+      local app
+      app=$(terminal_app_from_command "$args" 2>/dev/null || true)
+      if [[ -n "$app" ]]; then
+        printf '%s\n' "$app"
+        return 0
+      fi
+
+      pid="$ppid"
+      ((depth++))
+    done
+  fi
+
+  local frontmost_app
+  frontmost_app=$(current_frontmost_app)
+  if is_known_terminal_app "$frontmost_app"; then
+    printf '%s\n' "$frontmost_app"
+    return 0
+  fi
+
+  echo "Error: could not determine terminal app for current tmux client" >&2
+  return 1
+}
+
 function cmd_reload {
   echo "Reloading extension..."
 
@@ -539,25 +629,61 @@ function cmd_picker {
   esac
 }
 
-function cmd_clean {
-  local id
-  id=$(request_id)
-  local response
-  response=$(chrome_cmd "{\"type\":\"clean_tabs\",\"id\":\"$id\"}")
+function cmd_swap_window {
+  local terminal_app
+  terminal_app=$(detect_tmux_terminal_app) || return 1
 
-  local success
-  success=$(echo "$response" | jq -r '.success // false')
-  if [[ "$success" == "true" ]]; then
-    local moved
-    moved=$(echo "$response" | jq -r '.data.moved // 0')
-    local group
-    group=$(echo "$response" | jq -r '.data.group // "native"')
-    echo "Moved $moved ungrouped tab(s) into '$group'"
-  else
-    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+  local previous_app
+  previous_app=$(current_frontmost_app)
+
+  local terminal_geometry
+  terminal_geometry=$(ax_window_geometry "$terminal_app" get) || {
+    echo "Error: failed to read geometry for $terminal_app" >&2
     return 1
+  }
+
+  local terminal_x terminal_y terminal_width terminal_height
+  IFS=$'\t' read -r terminal_x terminal_y terminal_width terminal_height <<< "$terminal_geometry"
+
+  local chrome_bounds
+  chrome_bounds=$(osascript <<'APPLESCRIPT'
+tell application "Google Chrome"
+  if (count of windows) is 0 then
+    error "No window found for Google Chrome"
+  end if
+  set b to bounds of front window
+  return (item 1 of b as text) & "|" & (item 2 of b as text) & "|" & ((item 3 of b) - (item 1 of b) as text) & "|" & ((item 4 of b) - (item 2 of b) as text)
+end tell
+APPLESCRIPT
+) || {
+    echo "Error: failed to read geometry for Google Chrome" >&2
+    return 1
+  }
+
+  local chrome_x chrome_y chrome_width chrome_height
+  IFS='|' read -r chrome_x chrome_y chrome_width chrome_height <<< "$chrome_bounds"
+
+  ax_window_geometry "$terminal_app" set "$chrome_x" "$chrome_y" "$chrome_width" "$chrome_height" >/dev/null || {
+    echo "Error: failed to move $terminal_app window" >&2
+    return 1
+  }
+
+  osascript <<APPLESCRIPT >/dev/null
+ tell application "Google Chrome"
+   set bounds of front window to {$terminal_x, $terminal_y, $((terminal_x + terminal_width)), $((terminal_y + terminal_height))}
+ end tell
+APPLESCRIPT
+
+  tmux refresh-client -S >/dev/null 2>&1 || true
+  tmux refresh-client -C ${chrome_width}x${chrome_height} >/dev/null 2>&1 || true
+
+  if [[ -n "$previous_app" ]]; then
+    cmd_focus "$previous_app" >/dev/null 2>&1 || true
   fi
+
+  echo "Swapped window geometry: $terminal_app ↔ Google Chrome"
 }
+
 
 function main {
   local subcmd="${1:-}"
@@ -582,8 +708,9 @@ function main {
     clean)   cmd_clean ;;
     sync)    cmd_sync ;;
     picker)  cmd_picker ;;
+    swap-window) cmd_swap_window ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|picker}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|picker|swap-window}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -602,6 +729,7 @@ function main {
       echo "  reload          Restart Chrome extension and reconnect bridge"
       echo "  clean           Close all tabs not belonging to any tab group"
       echo "  sync            Remove tab groups with no matching tmux window"
+      echo "  swap-window     Swap current tmux terminal window geometry with active Chrome window"
       return 1
       ;;
   esac

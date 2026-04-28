@@ -1,6 +1,7 @@
-import { Action, ActionPanel, Color, Icon, List, showToast, Toast } from "@raycast/api";
+import { Action, ActionPanel, closeMainWindow, Color, Icon, List, PopToRootType, showToast, Toast } from "@raycast/api";
 import { usePromise } from "@raycast/utils";
 import { deleteGroup, listGroups, switchGroup, type TabGroup } from "./bridge";
+import { activateMacApp } from "./tmux";
 
 const COLOR_MAP: Record<string, Color> = {
   grey: Color.SecondaryText,
@@ -53,8 +54,8 @@ export default function SwitchTabGroup() {
                 onAction={async () => {
                   try {
                     await switchGroup(group.title);
-                    await showToast({ style: Toast.Style.Success, title: `Switched to ${group.title}` });
-                    revalidate();
+                    await activateMacApp("Google Chrome");
+                    await closeMainWindow({ popToRootType: PopToRootType.Immediate });
                   } catch (e) {
                     await showToast({ style: Toast.Style.Failure, title: "Failed", message: String(e) });
                   }

@@ -15,14 +15,18 @@ declare type Preferences = ExtensionPreferences
 declare namespace Preferences {
   /** Preferences accessible in the `switch-tab-group` command */
   export type SwitchTabGroup = ExtensionPreferences & {}
-  /** Preferences accessible in the `browse-tabs` command */
-  export type BrowseTabs = ExtensionPreferences & {}
+  /** Preferences accessible in the `switch-tab` command */
+  export type SwitchTab = ExtensionPreferences & {}
+  /** Preferences accessible in the `switch-tmux-window` command */
+  export type SwitchTmuxWindow = ExtensionPreferences & {}
 }
 
 declare namespace Arguments {
   /** Arguments passed to the `switch-tab-group` command */
   export type SwitchTabGroup = {}
-  /** Arguments passed to the `browse-tabs` command */
-  export type BrowseTabs = {}
+  /** Arguments passed to the `switch-tab` command */
+  export type SwitchTab = {}
+  /** Arguments passed to the `switch-tmux-window` command */
+  export type SwitchTmuxWindow = {}
 }
 
