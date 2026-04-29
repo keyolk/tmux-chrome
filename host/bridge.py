@@ -1,4 +1,4 @@
-#!/Users/gavin.jeong/.local/share/mise/installs/python/3.12.9/bin/python3
+#!/usr/bin/env python3
 """
 Native Messaging Host for tmux-Chrome Tab Group Bridge.
 
