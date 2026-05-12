@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-BRIDGE_DIR="$HOME/src/keyolk/tmux-chrome-bridge"
+BRIDGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NATIVE_HOST_DIR="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
 NATIVE_HOST_NAME="com.tmux.chrome.bridge"
 MANIFEST_PATH="$NATIVE_HOST_DIR/$NATIVE_HOST_NAME.json"
