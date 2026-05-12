@@ -136,6 +136,10 @@ async function handleMessage(msg) {
       return getTabs(msg.name, msg.all, msg.active);
     case "focus_tab":
       return focusTab(msg.tab_id);
+    case "raise_group_window":
+      return raiseGroupWindow(msg.name);
+    case "raise_tab_window":
+      return raiseTabWindow(msg.tab_id);
     case "rename_group":
       return renameGroup(msg.old_name, msg.new_name);
     case "clean_tabs":
@@ -237,6 +241,7 @@ async function listGroups() {
 async function addTab(groupName, url, active = false) {
   let group = await findGroupByTitle(groupName);
 
+  let result;
   // Create group if it doesn't exist
   if (!group) {
     const tab = await chrome.tabs.create({ url, active });
@@ -246,14 +251,25 @@ async function addTab(groupName, url, active = false) {
       collapsed: false,
     });
     await collapseAllExcept(groupId);
-    return { group_id: groupId, tab_id: tab.id, created_group: true };
+    result = { group_id: groupId, tab_id: tab.id, window_id: tab.windowId, created_group: true };
+  } else {
+    // Add tab to existing group, in the same window the group lives in
+    const tab = await chrome.tabs.create({ url, active, windowId: group.windowId });
+    await chrome.tabs.group({ tabIds: [tab.id], groupId: group.id });
+    await collapseAllExcept(group.id);
+    result = { group_id: group.id, tab_id: tab.id, window_id: group.windowId, created_group: false };
   }
 
-  // Add tab to existing group
-  const tab = await chrome.tabs.create({ url, active });
-  await chrome.tabs.group({ tabIds: [tab.id], groupId: group.id });
-  await collapseAllExcept(group.id);
-  return { group_id: group.id, tab_id: tab.id, created_group: false };
+  // If the caller wants the new tab active, also raise the owning Chrome window
+  // within Chrome. OS-level app activation is handled by the CLI caller.
+  if (active && result.window_id != null) {
+    try {
+      await chrome.windows.update(result.window_id, { focused: true });
+    } catch (_) {
+      // best-effort
+    }
+  }
+  return result;
 }
 
 async function moveTab(groupName) {
@@ -378,6 +394,28 @@ async function focusTab(tabId) {
   }
 
   return { tab_id: tabId, group_id: tab.groupId };
+}
+
+// raiseChromeWindow — explicit user-driven window focus.
+// Only invoked from Raycast commands where the user *picked* a target.
+// The "no chrome.windows.update({focused:true})" rule applies to passive
+// auto-sync flows (port messages), not to deliberate user selection.
+async function raiseChromeWindow(windowId) {
+  await chrome.windows.update(windowId, { focused: true, drawAttention: true });
+  return { window_id: windowId };
+}
+
+async function raiseGroupWindow(name) {
+  const group = await findGroupByTitle(name);
+  if (!group) throw new Error(`Tab group "${name}" not found`);
+  const tabs = await chrome.tabs.query({ groupId: group.id });
+  if (tabs.length === 0) throw new Error(`Tab group "${name}" has no tabs`);
+  return raiseChromeWindow(tabs[0].windowId);
+}
+
+async function raiseTabWindow(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  return raiseChromeWindow(tab.windowId);
 }
 
 async function renameGroup(oldName, newName) {

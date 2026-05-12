@@ -270,6 +270,9 @@ function cmd_open {
   success=$(echo "$response" | jq -r '.success // false')
   if [[ "$success" == "true" ]]; then
     echo "Opened in '$group_name': $url"
+    # Bring Chrome to the foreground so the user sees the new tab.
+    # Extension already focuses the right Chrome window via chrome.windows.update.
+    cmd_focus chrome >/dev/null 2>&1 || true
   else
     echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
     return 1
