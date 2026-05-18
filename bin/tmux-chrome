@@ -632,6 +632,37 @@ function cmd_picker {
   esac
 }
 
+function cmd_merge {
+  local id
+  id=$(request_id)
+  local response
+  response=$(chrome_cmd "{\"type\":\"merge_windows\",\"id\":\"$id\"}")
+
+  if [[ -z "$response" ]]; then
+    echo "No response from Chrome bridge" >&2
+    return 1
+  fi
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" != "true" ]]; then
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+
+  local merged moved groups target
+  merged=$(echo "$response" | jq -r '.data.windows_merged // 0')
+  moved=$(echo "$response" | jq -r '.data.moved_tabs // 0')
+  groups=$(echo "$response" | jq -r '.data.merged_groups // 0')
+  target=$(echo "$response" | jq -r '.data.target_window_id // "?"')
+
+  if [[ "$merged" == "0" ]]; then
+    echo "Only one Chrome window — nothing to merge."
+  else
+    echo "Merged $merged window(s) into window $target: $moved tab(s), $groups new group(s) moved."
+  fi
+}
+
 function cmd_swap_window {
   local terminal_app
   terminal_app=$(detect_tmux_terminal_app) || return 1
@@ -710,10 +741,11 @@ function main {
     reload)  cmd_reload ;;
     clean)   cmd_clean ;;
     sync)    cmd_sync ;;
+    merge)   cmd_merge ;;
     picker)  cmd_picker ;;
     swap-window) cmd_swap_window ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|picker|swap-window}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|merge|picker|swap-window}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -732,6 +764,7 @@ function main {
       echo "  reload          Restart Chrome extension and reconnect bridge"
       echo "  clean           Close all tabs not belonging to any tab group"
       echo "  sync            Remove tab groups with no matching tmux window"
+      echo "  merge           Merge all Chrome windows of this profile into one"
       echo "  swap-window     Swap current tmux terminal window geometry with active Chrome window"
       return 1
       ;;

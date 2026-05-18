@@ -9,7 +9,9 @@ function makeId(): string {
   return `ray_${Date.now()}_${++requestCounter}`;
 }
 
-export async function bridgeRequest<T = unknown>(msg: Record<string, unknown>): Promise<T> {
+export async function bridgeRequest<T = unknown>(
+  msg: Record<string, unknown>,
+): Promise<T> {
   const id = makeId();
   const payload = JSON.stringify({ ...msg, id }) + "\n";
 
@@ -47,7 +49,11 @@ export async function bridgeRequest<T = unknown>(msg: Record<string, unknown>): 
     socket.on("error", (err) => {
       clearTimeout(timer);
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-        reject(new Error("Chrome bridge not running. Open Chrome with the tmux bridge extension."));
+        reject(
+          new Error(
+            "Chrome bridge not running. Open Chrome with the tmux bridge extension.",
+          ),
+        );
       } else {
         reject(err);
       }
@@ -93,6 +99,14 @@ export async function getActiveGroupTabs(): Promise<Tab[]> {
 
 export async function focusTab(tabId: number): Promise<void> {
   await bridgeRequest({ type: "focus_tab", tab_id: tabId });
+}
+
+export async function raiseGroupWindow(name: string): Promise<void> {
+  await bridgeRequest({ type: "raise_group_window", name });
+}
+
+export async function raiseTabWindow(tabId: number): Promise<void> {
+  await bridgeRequest({ type: "raise_tab_window", tab_id: tabId });
 }
 
 export async function deleteGroup(name: string): Promise<void> {

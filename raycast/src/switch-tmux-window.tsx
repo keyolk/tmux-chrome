@@ -1,6 +1,24 @@
-import { Action, ActionPanel, closeMainWindow, Color, Icon, List, PopToRootType, showToast, Toast } from "@raycast/api";
+import {
+  Action,
+  ActionPanel,
+  closeMainWindow,
+  Color,
+  Icon,
+  List,
+  PopToRootType,
+  showToast,
+  Toast,
+} from "@raycast/api";
 import { usePromise } from "@raycast/utils";
-import { activateMacApp, detectTmuxTerminalApp, focusTmuxWindow, killWindow, listWindows, type TmuxWindow } from "./tmux";
+import {
+  activateMacApp,
+  detectTmuxTerminalApp,
+  focusTmuxWindow,
+  killWindow,
+  listWindows,
+  raiseTmuxTerminalWindow,
+  type TmuxWindow,
+} from "./tmux";
 
 function windowTitle(window: TmuxWindow): string {
   const name = window.windowName?.trim();
@@ -16,7 +34,9 @@ function windowAccessories(window: TmuxWindow): List.Item.Accessory[] {
   if (window.zoomed) {
     accessories.push({ tag: { value: "zoomed", color: Color.Orange } });
   }
-  accessories.push({ text: `${window.paneCount} pane${window.paneCount !== 1 ? "s" : ""}` });
+  accessories.push({
+    text: `${window.paneCount} pane${window.paneCount !== 1 ? "s" : ""}`,
+  });
   return accessories;
 }
 
@@ -26,22 +46,31 @@ export default function SwitchTmuxWindow() {
   if (error) {
     return (
       <List>
-        <List.EmptyView icon={Icon.Warning} title="tmux unavailable" description={error.message} />
+        <List.EmptyView
+          icon={Icon.Warning}
+          title="tmux unavailable"
+          description={error.message}
+        />
       </List>
     );
   }
 
-  const grouped = (data ?? []).reduce<Record<string, TmuxWindow[]>>((acc, win) => {
-    (acc[win.sessionName] ??= []).push(win);
-    return acc;
-  }, {});
+  const grouped = (data ?? []).reduce<Record<string, TmuxWindow[]>>(
+    (acc, win) => {
+      (acc[win.sessionName] ??= []).push(win);
+      return acc;
+    },
+    {},
+  );
 
   const sessionNames = Object.keys(grouped).sort((a, b) => a.localeCompare(b));
 
   return (
     <List isLoading={isLoading} searchBarPlaceholder="Search tmux windows...">
       {sessionNames.map((sessionName) => {
-        const windows = [...grouped[sessionName]].sort((a, b) => a.windowIndex - b.windowIndex);
+        const windows = [...grouped[sessionName]].sort(
+          (a, b) => a.windowIndex - b.windowIndex,
+        );
         return (
           <List.Section key={sessionName} title={sessionName}>
             {windows.map((window) => (
@@ -54,7 +83,11 @@ export default function SwitchTmuxWindow() {
                   tintColor: window.active ? Color.Green : Color.PrimaryText,
                 }}
                 accessories={windowAccessories(window)}
-                keywords={[sessionName, window.windowId, String(window.windowIndex)]}
+                keywords={[
+                  sessionName,
+                  window.windowId,
+                  String(window.windowIndex),
+                ]}
                 actions={
                   <ActionPanel>
                     <Action
@@ -63,13 +96,28 @@ export default function SwitchTmuxWindow() {
                       onAction={async () => {
                         try {
                           await focusTmuxWindow(window);
-                          const terminalApp = await detectTmuxTerminalApp();
-                          if (terminalApp) {
-                            await activateMacApp(terminalApp);
+                          let raised = false;
+                          try {
+                            await raiseTmuxTerminalWindow(window);
+                            raised = true;
+                          } catch (e) {
+                            console.warn("raiseTmuxTerminalWindow failed", e);
                           }
-                          await closeMainWindow({ popToRootType: PopToRootType.Immediate });
+                          if (!raised) {
+                            const terminalApp = await detectTmuxTerminalApp();
+                            if (terminalApp) {
+                              await activateMacApp(terminalApp);
+                            }
+                          }
+                          await closeMainWindow({
+                            popToRootType: PopToRootType.Immediate,
+                          });
                         } catch (e) {
-                          await showToast({ style: Toast.Style.Failure, title: "Failed", message: String(e) });
+                          await showToast({
+                            style: Toast.Style.Failure,
+                            title: "Failed",
+                            message: String(e),
+                          });
                         }
                       }}
                     />
@@ -94,7 +142,11 @@ export default function SwitchTmuxWindow() {
                           });
                           revalidate();
                         } catch (e) {
-                          await showToast({ style: Toast.Style.Failure, title: "Failed", message: String(e) });
+                          await showToast({
+                            style: Toast.Style.Failure,
+                            title: "Failed",
+                            message: String(e),
+                          });
                         }
                       }}
                     />

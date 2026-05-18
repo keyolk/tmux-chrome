@@ -144,6 +144,8 @@ async function handleMessage(msg) {
       return renameGroup(msg.old_name, msg.new_name);
     case "clean_tabs":
       return cleanTabs();
+    case "merge_windows":
+      return mergeWindows();
     default:
       throw new Error(`Unknown message type: ${msg.type}`);
   }
@@ -448,6 +450,107 @@ async function cleanTabs() {
   }
 
   return { moved: tabIds.length, group: RESERVED_GROUP_TITLE };
+}
+
+// mergeWindows — collapse all normal Chrome windows of this profile into the
+// single window with the most tabs. Tab groups are preserved; groups whose
+// title already exists in the target window absorb the source group's tabs
+// (their group entity is dropped), otherwise the entire group is moved over.
+// Returns counts so the CLI can report what happened.
+async function mergeWindows() {
+  const windows = await chrome.windows.getAll({
+    populate: true,
+    windowTypes: ["normal"],
+  });
+
+  if (windows.length <= 1) {
+    return {
+      windows_merged: 0,
+      target_window_id: windows[0]?.id ?? null,
+      moved_tabs: 0,
+      merged_groups: 0,
+    };
+  }
+
+  let target = windows[0];
+  for (const w of windows) {
+    if ((w.tabs?.length ?? 0) > (target.tabs?.length ?? 0)) target = w;
+  }
+
+  const sourceWindows = windows.filter((w) => w.id !== target.id);
+
+  // Index of group titles already present in the target window so we can
+  // absorb same-named source groups into them instead of creating duplicates.
+  const targetGroupsByTitle = new Map();
+  {
+    const targetGroups = await chrome.tabGroups.query({ windowId: target.id });
+    for (const g of targetGroups) {
+      const key = (g.title ?? "").toLowerCase();
+      if (!targetGroupsByTitle.has(key)) targetGroupsByTitle.set(key, g);
+    }
+  }
+
+  let movedTabs = 0;
+  let mergedGroups = 0;
+
+  for (const sw of sourceWindows) {
+    const sourceGroups = await chrome.tabGroups.query({ windowId: sw.id });
+    const handledGroupIds = new Set();
+
+    // Tabs that belong to a source group: handle group-by-group so we can
+    // either move the whole group or merge into a same-titled target group.
+    for (const sg of sourceGroups) {
+      handledGroupIds.add(sg.id);
+      const titleKey = (sg.title ?? "").toLowerCase();
+      const matching = targetGroupsByTitle.get(titleKey);
+      const tabs = await chrome.tabs.query({ groupId: sg.id });
+      if (tabs.length === 0) continue;
+      const tabIds = tabs.map((t) => t.id);
+
+      if (matching) {
+        // Move tabs into target window first, then re-group into the
+        // matching target group. chrome.tabs.move handles the cross-window
+        // hop in one call.
+        await chrome.tabs.move(tabIds, { windowId: target.id, index: -1 });
+        await chrome.tabs.group({ tabIds, groupId: matching.id });
+        movedTabs += tabIds.length;
+      } else {
+        // No same-titled group on the target: move the entire group entity.
+        await chrome.tabGroups.move(sg.id, { windowId: target.id, index: -1 });
+        // After the group lands on the target window it becomes a candidate
+        // for absorbing future same-titled groups from later source windows.
+        const refreshed = await chrome.tabGroups.get(sg.id);
+        targetGroupsByTitle.set((refreshed.title ?? "").toLowerCase(), refreshed);
+        movedTabs += tabIds.length;
+        mergedGroups += 1;
+      }
+    }
+
+    // Ungrouped tabs in the source window: just move them over.
+    const looseTabs = (sw.tabs ?? []).filter(
+      (t) => !handledGroupIds.has(t.groupId) && t.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE
+    );
+    if (looseTabs.length > 0) {
+      const ids = looseTabs.map((t) => t.id);
+      await chrome.tabs.move(ids, { windowId: target.id, index: -1 });
+      movedTabs += ids.length;
+    }
+
+    // Source window is now empty (or only has the placeholder new-tab Chrome
+    // may have created during the move dance) — close it.
+    try {
+      await chrome.windows.remove(sw.id);
+    } catch (_) {
+      // best-effort: some windows refuse to close (e.g. devtools) — leave them.
+    }
+  }
+
+  return {
+    windows_merged: sourceWindows.length,
+    target_window_id: target.id,
+    moved_tabs: movedTabs,
+    merged_groups: mergedGroups,
+  };
 }
 
 // --- Init ---

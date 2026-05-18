@@ -1,6 +1,22 @@
-import { Action, ActionPanel, closeMainWindow, Color, Icon, List, PopToRootType, showToast, Toast } from "@raycast/api";
+import {
+  Action,
+  ActionPanel,
+  closeMainWindow,
+  Color,
+  Icon,
+  List,
+  PopToRootType,
+  showToast,
+  Toast,
+} from "@raycast/api";
 import { usePromise } from "@raycast/utils";
-import { deleteGroup, listGroups, switchGroup, type TabGroup } from "./bridge";
+import {
+  deleteGroup,
+  listGroups,
+  raiseGroupWindow,
+  switchGroup,
+  type TabGroup,
+} from "./bridge";
 import { activateMacApp } from "./tmux";
 
 const COLOR_MAP: Record<string, Color> = {
@@ -25,7 +41,11 @@ export default function SwitchTabGroup() {
   if (error) {
     return (
       <List>
-        <List.EmptyView icon={Icon.Warning} title="Bridge not connected" description={error.message} />
+        <List.EmptyView
+          icon={Icon.Warning}
+          title="Bridge not connected"
+          description={error.message}
+        />
       </List>
     );
   }
@@ -37,7 +57,10 @@ export default function SwitchTabGroup() {
           key={group.id}
           title={group.title}
           subtitle={`${group.tab_count} tab${group.tab_count !== 1 ? "s" : ""}`}
-          icon={{ source: group.collapsed ? Icon.ChevronRight : Icon.ChevronDown, tintColor: groupColor(group.color) }}
+          icon={{
+            source: group.collapsed ? Icon.ChevronRight : Icon.ChevronDown,
+            tintColor: groupColor(group.color),
+          }}
           accessories={[
             {
               tag: {
@@ -54,10 +77,22 @@ export default function SwitchTabGroup() {
                 onAction={async () => {
                   try {
                     await switchGroup(group.title);
+                    try {
+                      await raiseGroupWindow(group.title);
+                    } catch (e) {
+                      // Non-fatal: still activate the app below.
+                      console.warn("raiseGroupWindow failed", e);
+                    }
                     await activateMacApp("Google Chrome");
-                    await closeMainWindow({ popToRootType: PopToRootType.Immediate });
+                    await closeMainWindow({
+                      popToRootType: PopToRootType.Immediate,
+                    });
                   } catch (e) {
-                    await showToast({ style: Toast.Style.Failure, title: "Failed", message: String(e) });
+                    await showToast({
+                      style: Toast.Style.Failure,
+                      title: "Failed",
+                      message: String(e),
+                    });
                   }
                 }}
               />
@@ -69,14 +104,26 @@ export default function SwitchTabGroup() {
                 onAction={async () => {
                   try {
                     await deleteGroup(group.title);
-                    await showToast({ style: Toast.Style.Success, title: `Deleted ${group.title}` });
+                    await showToast({
+                      style: Toast.Style.Success,
+                      title: `Deleted ${group.title}`,
+                    });
                     revalidate();
                   } catch (e) {
-                    await showToast({ style: Toast.Style.Failure, title: "Failed", message: String(e) });
+                    await showToast({
+                      style: Toast.Style.Failure,
+                      title: "Failed",
+                      message: String(e),
+                    });
                   }
                 }}
               />
-              <Action title="Refresh" icon={Icon.ArrowClockwise} shortcut={{ modifiers: ["cmd"], key: "r" }} onAction={revalidate} />
+              <Action
+                title="Refresh"
+                icon={Icon.ArrowClockwise}
+                shortcut={{ modifiers: ["cmd"], key: "r" }}
+                onAction={revalidate}
+              />
             </ActionPanel>
           }
         />

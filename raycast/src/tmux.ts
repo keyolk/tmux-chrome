@@ -32,12 +32,16 @@ export interface TmuxWindow {
 
 async function tmux(args: string[]): Promise<string> {
   try {
-    const { stdout } = await execFileAsync(TMUX_BIN, args, { maxBuffer: 1024 * 1024 });
+    const { stdout } = await execFileAsync(TMUX_BIN, args, {
+      maxBuffer: 1024 * 1024,
+    });
     return stdout;
   } catch (error) {
     const err = error as NodeJS.ErrnoException & { stderr?: string };
     if (err.code === "ENOENT") {
-      throw new Error(`tmux binary not found at ${TMUX_BIN}. Set TMUX_BIN env to override.`);
+      throw new Error(
+        `tmux binary not found at ${TMUX_BIN}. Set TMUX_BIN env to override.`,
+      );
     }
     const stderr = err.stderr?.toString().trim();
     if (stderr?.includes("no server running")) {
@@ -71,7 +75,16 @@ export async function listWindows(): Promise<TmuxWindow[]> {
       if (parts.length < 8) {
         throw new Error(`Unexpected tmux line: ${line}`);
       }
-      const [sessionName, windowIndex, windowId, active, zoomed, paneCount, attached, ...rest] = parts;
+      const [
+        sessionName,
+        windowIndex,
+        windowId,
+        active,
+        zoomed,
+        paneCount,
+        attached,
+        ...rest
+      ] = parts;
       const windowName = rest.join(SEP);
       return {
         sessionName,
@@ -111,27 +124,55 @@ export async function getActiveWindowName(): Promise<string | null> {
   return active?.windowName?.trim() || null;
 }
 
-export async function detectTmuxTerminalApp(): Promise<string | null> {
-  let clientPid: number | null = null;
+interface TerminalAncestor {
+  pid: number;
+  appName: string;
+}
+
+async function getTmuxClientPid(): Promise<number | null> {
   try {
     const stdout = await tmux(["display-message", "-p", "#{client_pid}"]);
     const parsed = Number(stdout.trim());
-    if (Number.isFinite(parsed) && parsed > 0) {
-      clientPid = parsed;
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  } catch (_) {
+    // ignore — caller falls back
+  }
+  return null;
+}
+
+async function getClientPidForSession(
+  sessionName: string,
+): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      TMUX_BIN,
+      ["list-clients", "-t", sessionName, "-F", "#{client_pid}"],
+      { maxBuffer: 1024 * 1024 },
+    );
+    for (const line of stdout.split("\n")) {
+      const parsed = Number(line.trim());
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
     }
   } catch (_) {
-    // ignore — fallback to ps walk
+    // ignore
   }
+  return null;
+}
 
-  const ancestry: number[] = [];
-  let pid = clientPid;
+async function findTerminalAncestor(
+  startPid: number | null,
+): Promise<TerminalAncestor | null> {
+  let pid = startPid;
   let depth = 0;
   while (pid && pid > 1 && depth < 25) {
-    ancestry.push(pid);
     try {
-      const { stdout } = await execFileAsync("ps", ["-o", "ppid=,args=", "-p", String(pid)], {
-        maxBuffer: 1024 * 1024,
-      });
+      const { stdout } = await execFileAsync(
+        "ps",
+        ["-o", "ppid=,args=", "-p", String(pid)],
+        {
+          maxBuffer: 1024 * 1024,
+        },
+      );
       const trimmed = stdout.trim();
       if (!trimmed) break;
       const space = trimmed.indexOf(" ");
@@ -139,7 +180,7 @@ export async function detectTmuxTerminalApp(): Promise<string | null> {
       const ppid = Number(trimmed.slice(0, space).trim());
       const args = trimmed.slice(space + 1).trim();
       const matched = matchTerminalApp(args);
-      if (matched) return matched;
+      if (matched) return { pid, appName: matched };
       pid = Number.isFinite(ppid) ? ppid : null;
     } catch (_) {
       break;
@@ -149,16 +190,62 @@ export async function detectTmuxTerminalApp(): Promise<string | null> {
 
   // Fallback: scan all processes for a known terminal binary
   try {
-    const { stdout } = await execFileAsync("ps", ["-axo", "comm,args"], { maxBuffer: 4 * 1024 * 1024 });
+    const { stdout } = await execFileAsync("ps", ["-axo", "pid=,comm=,args="], {
+      maxBuffer: 4 * 1024 * 1024,
+    });
     for (const line of stdout.split("\n")) {
-      const matched = matchTerminalApp(line);
-      if (matched) return matched;
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const space = trimmed.indexOf(" ");
+      if (space < 0) continue;
+      const candidatePid = Number(trimmed.slice(0, space).trim());
+      const matched = matchTerminalApp(trimmed.slice(space + 1));
+      if (matched && Number.isFinite(candidatePid) && candidatePid > 0) {
+        return { pid: candidatePid, appName: matched };
+      }
     }
   } catch (_) {
     // ignore
   }
 
   return null;
+}
+
+export async function detectTmuxTerminalApp(): Promise<string | null> {
+  const clientPid = await getTmuxClientPid();
+  const ancestor = await findTerminalAncestor(clientPid);
+  return ancestor?.appName ?? null;
+}
+
+export async function raiseTmuxTerminalWindow(
+  window: TmuxWindow,
+): Promise<void> {
+  // Resolve a client_pid that's attached to this window's session, falling
+  // back to the current display message if needed.
+  let clientPid = await getClientPidForSession(window.sessionName);
+  if (!clientPid) clientPid = await getTmuxClientPid();
+
+  const ancestor = await findTerminalAncestor(clientPid);
+  if (!ancestor) {
+    // Nothing to raise. Caller can still activateMacApp as a fallback.
+    return;
+  }
+
+  const script = `
+    tell application "System Events"
+      try
+        set p to first process whose unix id is ${ancestor.pid}
+        set frontmost of p to true
+        try
+          tell p to perform action "AXRaise" of window 1
+        end try
+      on error errMsg
+        -- Fall through to bundle activation below
+      end try
+    end tell
+    tell application "${ancestor.appName}" to activate
+  `;
+  await execFileAsync("/usr/bin/osascript", ["-e", script]);
 }
 
 function matchTerminalApp(text: string): string | null {
@@ -169,5 +256,8 @@ function matchTerminalApp(text: string): string | null {
 }
 
 export async function activateMacApp(appName: string): Promise<void> {
-  await execFileAsync("/usr/bin/osascript", ["-e", `tell application "${appName}" to activate`]);
+  await execFileAsync("/usr/bin/osascript", [
+    "-e",
+    `tell application "${appName}" to activate`,
+  ]);
 }
