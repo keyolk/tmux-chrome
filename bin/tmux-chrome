@@ -457,6 +457,8 @@ function cmd_grab {
   fi
 
   local count=0
+  local total
+  total=$(echo "$selected" | grep -c .)
   local group_json
   group_json=$(printf '%s' "$group_name" | json_escape)
   while IFS= read -r url; do
@@ -465,12 +467,22 @@ function cmd_grab {
       id=$(request_id)
       local url_json
       url_json=$(printf '%s' "$url" | json_escape)
-      chrome_cmd "{\"type\":\"add_tab\",\"name\":${group_json},\"url\":${url_json},\"id\":\"$id\"}" > /dev/null
       ((count++))
+      local active="false"
+      if [[ "$count" -eq "$total" ]]; then
+        active="true"
+      fi
+      chrome_cmd "{\"type\":\"add_tab\",\"name\":${group_json},\"url\":${url_json},\"active\":${active},\"id\":\"$id\"}" > /dev/null
     fi
   done <<< "$selected"
 
   echo "Added $count tab(s) to group '$group_name'"
+  # Raise Chrome to the foreground so the user sees the new tabs.
+  # The extension already focused the right Chrome window via active:true
+  # on the final add_tab; this just handles OS-level app activation.
+  if [[ "$count" -gt 0 ]]; then
+    cmd_focus chrome >/dev/null 2>&1 || true
+  fi
 }
 
 function cmd_tabs {
@@ -691,6 +703,34 @@ function cmd_merge {
   fi
 }
 
+function cmd_cycle_tab {
+  local direction="${1:-next}"
+  case "$direction" in
+    prev|next) ;;
+    *)
+      echo "Usage: tmux-chrome cycle-tab {prev|next}" >&2
+      return 1
+      ;;
+  esac
+
+  local id
+  id=$(request_id)
+  local response
+  response=$(chrome_cmd "{\"type\":\"cycle_tab_in_group\",\"direction\":\"${direction}\",\"id\":\"$id\"}")
+
+  if [[ -z "$response" ]]; then
+    echo "No response from Chrome bridge" >&2
+    return 1
+  fi
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" != "true" ]]; then
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+}
+
 function cmd_swap_window {
   local terminal_app
   terminal_app=$(detect_tmux_terminal_app) || return 1
@@ -770,10 +810,11 @@ function main {
     clean)   cmd_clean ;;
     sync)    cmd_sync ;;
     merge)   cmd_merge ;;
+    cycle-tab) cmd_cycle_tab "$@" ;;
     picker)  cmd_picker ;;
     swap-window) cmd_swap_window ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|merge|picker|swap-window}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|merge|cycle-tab|picker|swap-window}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -793,6 +834,7 @@ function main {
       echo "  clean           Close all tabs not belonging to any tab group"
       echo "  sync            Remove tab groups with no matching tmux window"
       echo "  merge           Merge all Chrome windows of this profile into one"
+      echo "  cycle-tab {prev|next}  Cycle focus within the active tab group (wraps)"
       echo "  swap-window     Swap current tmux terminal window geometry with active Chrome window"
       return 1
       ;;

@@ -2,7 +2,7 @@
 // Communicates with native messaging host to sync tab groups with tmux windows.
 // RULE: Never call chrome.windows.update({focused: true}) — terminal must keep focus.
 
-const BUILD_MARKER = "tmux-chrome-bridge:active-group-2026-04-28";
+const BUILD_MARKER = "tmux-chrome-bridge:cycle-tab-2026-05-20";
 console.log("[tmux-chrome] background loaded:", BUILD_MARKER);
 
 const NATIVE_HOST = "com.tmux.chrome.bridge";
@@ -146,6 +146,8 @@ async function handleMessage(msg) {
       return cleanTabs();
     case "merge_windows":
       return mergeWindows();
+    case "cycle_tab_in_group":
+      return cycleTabInGroup(msg.direction);
     default:
       throw new Error(`Unknown message type: ${msg.type}`);
   }
@@ -550,6 +552,58 @@ async function mergeWindows() {
     target_window_id: target.id,
     moved_tabs: movedTabs,
     merged_groups: mergedGroups,
+  };
+}
+
+// cycleTabInGroup — Move focus to the previous or next tab inside the
+// active tab's group, wrapping around at the boundaries. No-op if the
+// active tab is not in any group, or the group has only one tab.
+async function cycleTabInGroup(direction) {
+  if (direction !== "prev" && direction !== "next") {
+    throw new Error(`Unknown direction: ${direction}`);
+  }
+
+  const group = await getActiveGroup();
+  if (!group) {
+    return { skipped: true, reason: "no_active_group" };
+  }
+
+  // chrome.tabs.query returns tabs in their visual (left-to-right) order
+  // within the window, which matches what the user perceives as "next" / "prev".
+  const tabs = await chrome.tabs.query({ groupId: group.id });
+  if (tabs.length <= 1) {
+    return { skipped: true, reason: "single_tab", group_id: group.id };
+  }
+
+  const [activeTab] = await chrome.tabs.query({
+    active: true,
+    windowId: group.windowId,
+  });
+  if (!activeTab) {
+    return { skipped: true, reason: "no_active_tab" };
+  }
+
+  const idx = tabs.findIndex((t) => t.id === activeTab.id);
+  if (idx < 0) {
+    // Active tab is not in this group — shouldn't happen since we derived
+    // the group from the active tab, but bail out defensively.
+    return { skipped: true, reason: "active_outside_group" };
+  }
+
+  const offset = direction === "next" ? 1 : -1;
+  const nextIdx = (idx + offset + tabs.length) % tabs.length;
+  const target = tabs[nextIdx];
+
+  await chrome.tabs.update(target.id, { active: true });
+  rememberActiveTabForGroup(group.id, target.id);
+
+  return {
+    group_id: group.id,
+    from_tab_id: activeTab.id,
+    to_tab_id: target.id,
+    direction,
+    index: nextIdx,
+    total: tabs.length,
   };
 }
 
