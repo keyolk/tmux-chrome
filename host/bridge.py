@@ -20,6 +20,32 @@ import threading
 SOCKET_PATH = "/tmp/tmux-chrome-bridge.sock"
 
 
+def _strip_surrogates(value):
+    """Recursively replace lone surrogates with U+FFFD so json.dumps does not
+    explode with 'surrogates not allowed' when Chrome hands us a tab title
+    containing invalid UTF-16 / lone-surrogate codepoints."""
+    if isinstance(value, str):
+        return value.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(value, list):
+        return [_strip_surrogates(v) for v in value]
+    if isinstance(value, dict):
+        return {_strip_surrogates(k): _strip_surrogates(v) for k, v in value.items()}
+    return value
+
+
+def _safe_dumps(msg):
+    """json.dumps that tolerates lone surrogates anywhere inside msg. The
+    `json.dumps(...).encode("utf-8")` step is where lone surrogates blow up
+    with 'surrogates not allowed', so we catch that and retry after replacing
+    the offending codepoints with U+FFFD."""
+    try:
+        encoded = json.dumps(msg)
+        encoded.encode("utf-8")
+        return encoded
+    except UnicodeEncodeError:
+        return json.dumps(_strip_surrogates(msg))
+
+
 def read_native_message():
     """Read a native messaging protocol message from stdin."""
     raw_length = sys.stdin.buffer.read(4)
@@ -31,12 +57,12 @@ def read_native_message():
     data = sys.stdin.buffer.read(length)
     if len(data) < length:
         return None
-    return json.loads(data.decode("utf-8"))
+    return json.loads(data.decode("utf-8", "replace"))
 
 
 def send_native_message(msg):
     """Send a native messaging protocol message to stdout (Chrome)."""
-    encoded = json.dumps(msg).encode("utf-8")
+    encoded = _safe_dumps(msg).encode("utf-8")
     sys.stdout.buffer.write(struct.pack("<I", len(encoded)))
     sys.stdout.buffer.write(encoded)
     sys.stdout.buffer.flush()
@@ -116,7 +142,7 @@ def handle_client(conn):
             if b"\n" in data:
                 break
 
-        line = data.decode("utf-8").strip()
+        line = data.decode("utf-8", "replace").strip()
         if not line:
             return
 
@@ -126,12 +152,12 @@ def handle_client(conn):
         response = send_and_wait(msg)
 
         # Send response back to client
-        response_bytes = (json.dumps(response) + "\n").encode("utf-8")
+        response_bytes = (_safe_dumps(response) + "\n").encode("utf-8")
         conn.sendall(response_bytes)
 
     except Exception as e:
         try:
-            error_response = json.dumps({"success": False, "error": str(e)}) + "\n"
+            error_response = _safe_dumps({"success": False, "error": str(e)}) + "\n"
             conn.sendall(error_response.encode("utf-8"))
         except Exception:
             pass

@@ -42,7 +42,7 @@ function request_id {
 }
 
 function json_escape {
-  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().rstrip("\n")))'
+  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().rstrip("\n"), ensure_ascii=False))'
 }
 
 CHROME_EXTENSION_ID="${TMUX_CHROME_EXT_ID:-dplackkpcodnphbdcmfppmcbhkonlecg}"
@@ -630,6 +630,34 @@ function cmd_picker {
       chrome_cmd "{\"type\":\"focus_tab\",\"tab_id\":$tab_id,\"id\":\"$focus_id\"}" > /dev/null
       ;;
   esac
+}
+
+function cmd_clean {
+  local id
+  id=$(request_id)
+  local response
+  response=$(chrome_cmd "{\"type\":\"clean_tabs\",\"id\":\"$id\"}")
+
+  if [[ -z "$response" ]]; then
+    echo "No response from Chrome bridge" >&2
+    return 1
+  fi
+
+  local success
+  success=$(echo "$response" | jq -r '.success // false')
+  if [[ "$success" != "true" ]]; then
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+
+  local moved group
+  moved=$(echo "$response" | jq -r '.data.moved // 0')
+  group=$(echo "$response" | jq -r '.data.group // "native"')
+  if [[ "$moved" == "0" ]]; then
+    echo "No ungrouped tabs to clean."
+  else
+    echo "Moved $moved ungrouped tab(s) into '$group' group."
+  fi
 }
 
 function cmd_merge {
