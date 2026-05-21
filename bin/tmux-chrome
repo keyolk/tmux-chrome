@@ -47,6 +47,97 @@ function json_escape {
 
 CHROME_EXTENSION_ID="${TMUX_CHROME_EXT_ID:-dplackkpcodnphbdcmfppmcbhkonlecg}"
 
+WORKING_PREFIX="⏳"
+DONE_PREFIX="🟢"
+
+function debug_log {
+  [[ "${TMUX_CHROME_DEBUG:-0}" == "1" ]] || return 0
+  echo "[tmux-chrome] $*" >&2
+}
+
+function normalize_window_title {
+  local title="$1"
+  title="${title#${WORKING_PREFIX}}"
+  title="${title#${DONE_PREFIX}}"
+  title="${title# }"
+  python3 -c '
+import re, sys, unicodedata
+s = sys.argv[1]
+s = unicodedata.normalize("NFKC", s).lower()
+s = re.sub(r"[^a-z0-9]+", "", s)
+print(s)
+' "$title"
+}
+
+function should_use_current_mapping_for_title {
+  local requested="$1"
+  local current
+  current=$(tmux_current_window_title)
+  [[ -n "$requested" && "$requested" == "$current" ]]
+}
+
+function tmux_get_group_title {
+  tmux show-option -qvw @chrome_group 2>/dev/null || true
+}
+
+function tmux_get_group_id {
+  tmux show-option -qvw @chrome_group_id 2>/dev/null || true
+}
+
+function tmux_get_group_window_id {
+  tmux show-option -qvw @chrome_window_id 2>/dev/null || true
+}
+
+function tmux_set_group_mapping {
+  local title="$1"
+  local group_id="$2"
+  local window_id="$3"
+  tmux set-option -qw @chrome_group "$title" 2>/dev/null || true
+  [[ -n "$group_id" ]] && tmux set-option -qw @chrome_group_id "$group_id" 2>/dev/null || true
+  [[ -n "$window_id" ]] && tmux set-option -qw @chrome_window_id "$window_id" 2>/dev/null || true
+  debug_log "mapping set title='$title' group_id='${group_id:-}' window_id='${window_id:-}'"
+}
+
+function tmux_clear_group_mapping {
+  tmux set-option -quw @chrome_group 2>/dev/null || true
+  tmux set-option -quw @chrome_group_id 2>/dev/null || true
+  tmux set-option -quw @chrome_window_id 2>/dev/null || true
+  debug_log "mapping cleared"
+}
+
+function tmux_current_window_title {
+  local raw
+  raw=$(tmux display-message -p '#W' 2>/dev/null || true)
+  normalize_window_title "$raw"
+}
+
+function build_group_locator_json {
+  local title="$1"
+  local group_id="$2"
+  local window_id="$3"
+  local parts=()
+  if [[ -n "$title" ]]; then
+    parts+=("\"name\":$(printf '%s' "$title" | json_escape)")
+  fi
+  if [[ -n "$group_id" && "$group_id" =~ ^[0-9-]+$ ]]; then
+    parts+=("\"group_id\":$group_id")
+  fi
+  if [[ -n "$window_id" && "$window_id" =~ ^[0-9-]+$ ]]; then
+    parts+=("\"window_id\":$window_id")
+  fi
+  local joined=""
+  local first=1
+  for p in "${parts[@]}"; do
+    if [[ $first -eq 1 ]]; then
+      joined="$p"
+      first=0
+    else
+      joined="$joined,$p"
+    fi
+  done
+  printf '{%s}' "$joined"
+}
+
 function current_frontmost_app {
   osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || true
 }
@@ -163,39 +254,58 @@ function cmd_reload {
 }
 
 function cmd_switch {
-  local window_name="${1:-$(tmux display-message -p '#W')}"
-  # Track current group name for rename detection
+  local window_name="${1:-$(tmux_current_window_title)}"
+  local group_id window_id
+  group_id=$(tmux_get_group_id)
+  window_id=$(tmux_get_group_window_id)
   tmux set-option -qw @chrome_group "$window_name" 2>/dev/null
-  # Silently skip if bridge is not running
   [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 0
-  local id
+  local id response locator
   id=$(request_id)
-  local window_json
-  window_json=$(printf '%s' "$window_name" | json_escape)
-  chrome_cmd "{\"type\":\"switch_window\",\"window_name\":${window_json},\"id\":\"$id\"}" > /dev/null 2>&1 || true
+  locator=$(build_group_locator_json "$window_name" "$group_id" "$window_id")
+  response=$(chrome_cmd "{\"type\":\"switch_window\",\"window_name\":$(printf '%s' "$window_name" | json_escape),\"locator\":${locator},\"id\":\"$id\"}" 2>/dev/null || true)
+  if [[ -n "$response" ]]; then
+    local success
+    success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+    if [[ "$success" == "true" ]]; then
+      local resolved_group_id resolved_window_id resolved_title
+      resolved_group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
+      resolved_window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
+      resolved_title=$(echo "$response" | jq -r '.data.group_title // empty' 2>/dev/null)
+      tmux_set_group_mapping "${resolved_title:-$window_name}" "$resolved_group_id" "$resolved_window_id"
+    fi
+  fi
 }
 
 function cmd_rename {
-  local old_name
-  old_name=$(tmux show-option -qvw @chrome_group 2>/dev/null)
-  local new_name
-  new_name=$(tmux display-message -p '#W')
+  local old_name new_name group_id window_id
+  old_name=$(normalize_window_title "$(tmux_get_group_title)")
+  new_name=$(tmux_current_window_title)
+  group_id=$(tmux_get_group_id)
+  window_id=$(tmux_get_group_window_id)
 
-  # Update tracking regardless of bridge state
   tmux set-option -qw @chrome_group "$new_name" 2>/dev/null
 
   if [[ -z "$old_name" || "$old_name" == "$new_name" ]]; then
     return 0
   fi
 
-  # Silently skip if bridge is not running
   [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 0
-  local id
+  local id response locator
   id=$(request_id)
-  local old_json new_json
-  old_json=$(printf '%s' "$old_name" | json_escape)
-  new_json=$(printf '%s' "$new_name" | json_escape)
-  chrome_cmd "{\"type\":\"rename_group\",\"old_name\":${old_json},\"new_name\":${new_json},\"id\":\"$id\"}" > /dev/null 2>&1 || true
+  locator=$(build_group_locator_json "$old_name" "$group_id" "$window_id")
+  response=$(chrome_cmd "{\"type\":\"rename_group\",\"old_name\":$(printf '%s' "$old_name" | json_escape),\"new_name\":$(printf '%s' "$new_name" | json_escape),\"locator\":${locator},\"id\":\"$id\"}" 2>/dev/null || true)
+  if [[ -n "$response" ]]; then
+    local success
+    success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+    if [[ "$success" == "true" ]]; then
+      local resolved_group_id resolved_window_id resolved_title
+      resolved_group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
+      resolved_window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
+      resolved_title=$(echo "$response" | jq -r '.data.new_name // empty' 2>/dev/null)
+      tmux_set_group_mapping "${resolved_title:-$new_name}" "$resolved_group_id" "$resolved_window_id"
+    fi
+  fi
 }
 
 function cmd_list {
@@ -220,17 +330,18 @@ function cmd_list {
 }
 
 function cmd_delete {
-  local group_name="${1:-$(tmux display-message -p '#W')}"
-  local id
+  local group_name="${1:-$(tmux_current_window_title)}"
+  local group_id window_id id response locator
+  group_id=$(tmux_get_group_id)
+  window_id=$(tmux_get_group_window_id)
   id=$(request_id)
-  local response
-  local group_json
-  group_json=$(printf '%s' "$group_name" | json_escape)
-  response=$(chrome_cmd "{\"type\":\"delete_group\",\"name\":${group_json},\"id\":\"$id\"}")
+  locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
+  response=$(chrome_cmd "{\"type\":\"delete_group\",\"name\":$(printf '%s' "$group_name" | json_escape),\"locator\":${locator},\"id\":\"$id\"}")
 
   local success
   success=$(echo "$response" | jq -r '.success // false')
   if [[ "$success" == "true" ]]; then
+    tmux_clear_group_mapping
     echo "Deleted tab group: $group_name"
   else
     echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
@@ -256,22 +367,23 @@ function cmd_open {
     return 1
   fi
 
-  local group_name
-  group_name=$(tmux display-message -p '#W')
-  local id
+  local group_name group_id window_id id response locator
+  group_name=$(tmux_current_window_title)
+  group_id=$(tmux_get_group_id)
+  window_id=$(tmux_get_group_window_id)
   id=$(request_id)
-  local response
-  local group_json url_json
-  group_json=$(printf '%s' "$group_name" | json_escape)
-  url_json=$(printf '%s' "$url" | json_escape)
-  response=$(chrome_cmd "{\"type\":\"add_tab\",\"name\":${group_json},\"url\":${url_json},\"active\":true,\"id\":\"$id\"}")
+  locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
+  response=$(chrome_cmd "{\"type\":\"add_tab\",\"locator\":${locator},\"name\":$(printf '%s' "$group_name" | json_escape),\"url\":$(printf '%s' "$url" | json_escape),\"active\":true,\"id\":\"$id\"}")
 
   local success
   success=$(echo "$response" | jq -r '.success // false')
   if [[ "$success" == "true" ]]; then
-    echo "Opened in '$group_name': $url"
-    # Bring Chrome to the foreground so the user sees the new tab.
-    # Extension already focuses the right Chrome window via chrome.windows.update.
+    local resolved_group_id resolved_window_id resolved_title
+    resolved_group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
+    resolved_window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
+    resolved_title=$(echo "$response" | jq -r '.data.group_title // empty' 2>/dev/null)
+    tmux_set_group_mapping "${resolved_title:-$group_name}" "$resolved_group_id" "$resolved_window_id"
+    echo "Opened in '${resolved_title:-$group_name}': $url"
     cmd_focus chrome >/dev/null 2>&1 || true
   else
     echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
@@ -285,25 +397,27 @@ function cmd_add {
     echo "Usage: tmux-chrome add <url>" >&2
     return 1
   fi
-  local group_name
-  group_name=$(tmux display-message -p '#W')
-  local id
+  local group_name group_id window_id id response locator
+  group_name=$(tmux_current_window_title)
+  group_id=$(tmux_get_group_id)
+  window_id=$(tmux_get_group_window_id)
   id=$(request_id)
-  local response
-  local group_json url_json
-  group_json=$(printf '%s' "$group_name" | json_escape)
-  url_json=$(printf '%s' "$url" | json_escape)
-  response=$(chrome_cmd "{\"type\":\"add_tab\",\"name\":${group_json},\"url\":${url_json},\"id\":\"$id\"}")
+  locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
+  response=$(chrome_cmd "{\"type\":\"add_tab\",\"locator\":${locator},\"name\":$(printf '%s' "$group_name" | json_escape),\"url\":$(printf '%s' "$url" | json_escape),\"id\":\"$id\"}")
 
   local success
   success=$(echo "$response" | jq -r '.success // false')
   if [[ "$success" == "true" ]]; then
-    local created
+    local created resolved_group_id resolved_window_id resolved_title
     created=$(echo "$response" | jq -r '.data.created_group // false')
+    resolved_group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
+    resolved_window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
+    resolved_title=$(echo "$response" | jq -r '.data.group_title // empty' 2>/dev/null)
+    tmux_set_group_mapping "${resolved_title:-$group_name}" "$resolved_group_id" "$resolved_window_id"
     if [[ "$created" == "true" ]]; then
-      echo "Created group '$group_name' and added tab: $url"
+      echo "Created group '${resolved_title:-$group_name}' and added tab: $url"
     else
-      echo "Added tab to '$group_name': $url"
+      echo "Added tab to '${resolved_title:-$group_name}': $url"
     fi
   else
     echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
@@ -312,19 +426,23 @@ function cmd_add {
 }
 
 function cmd_move {
-  local group_name
-  group_name=$(tmux display-message -p '#W')
-  local id
+  local group_name group_id window_id id response locator
+  group_name=$(tmux_current_window_title)
+  group_id=$(tmux_get_group_id)
+  window_id=$(tmux_get_group_window_id)
   id=$(request_id)
-  local response
-  local group_json
-  group_json=$(printf '%s' "$group_name" | json_escape)
-  response=$(chrome_cmd "{\"type\":\"move_tab\",\"name\":${group_json},\"id\":\"$id\"}")
+  locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
+  response=$(chrome_cmd "{\"type\":\"move_tab\",\"locator\":${locator},\"name\":$(printf '%s' "$group_name" | json_escape),\"id\":\"$id\"}")
 
   local success
   success=$(echo "$response" | jq -r '.success // false')
   if [[ "$success" == "true" ]]; then
-    echo "Moved active tab to group: $group_name"
+    local resolved_group_id resolved_window_id resolved_title
+    resolved_group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
+    resolved_window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
+    resolved_title=$(echo "$response" | jq -r '.data.group_title // empty' 2>/dev/null)
+    tmux_set_group_mapping "${resolved_title:-$group_name}" "$resolved_group_id" "$resolved_window_id"
+    echo "Moved active tab to group: ${resolved_title:-$group_name}"
   else
     echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
     return 1
@@ -348,18 +466,20 @@ function cmd_remove {
 }
 
 function cmd_export_group {
-  local group_name="${1:-$(tmux display-message -p '#W' 2>/dev/null)}"
+  local group_name="${1:-$(tmux_current_window_title 2>/dev/null)}"
   if [[ -z "$group_name" ]]; then
     echo "Usage: tmux-chrome export-group <group_name>" >&2
     return 1
   fi
 
-  local id
+  local group_id="" window_id="" id response locator
+  if [[ -z "$1" ]] || should_use_current_mapping_for_title "$group_name"; then
+    group_id=$(tmux_get_group_id)
+    window_id=$(tmux_get_group_window_id)
+  fi
   id=$(request_id)
-  local response
-  local group_json
-  group_json=$(printf '%s' "$group_name" | json_escape)
-  response=$(chrome_cmd "{\"type\":\"get_tabs\",\"name\":${group_json},\"id\":\"$id\"}" 2>/dev/null)
+  locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
+  response=$(chrome_cmd "{\"type\":\"get_tabs\",\"locator\":${locator},\"name\":$(printf '%s' "$group_name" | json_escape),\"id\":\"$id\"}" 2>/dev/null)
 
   local success
   success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
@@ -372,24 +492,28 @@ function cmd_export_group {
 }
 
 function cmd_clear_group {
-  local group_name="${1:-$(tmux display-message -p '#W' 2>/dev/null)}"
+  local group_name="${1:-$(tmux_current_window_title 2>/dev/null)}"
   if [[ -z "$group_name" ]]; then
     echo "Usage: tmux-chrome clear-group <group_name>" >&2
     return 1
   fi
 
-  local id
+  local group_id="" window_id="" id response locator
+  if [[ -z "$1" ]] || should_use_current_mapping_for_title "$group_name"; then
+    group_id=$(tmux_get_group_id)
+    window_id=$(tmux_get_group_window_id)
+  fi
   id=$(request_id)
-  local response
-  local group_json
-  group_json=$(printf '%s' "$group_name" | json_escape)
-  response=$(chrome_cmd "{\"type\":\"delete_group\",\"name\":${group_json},\"id\":\"$id\"}" 2>/dev/null) || true
+  locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
+  response=$(chrome_cmd "{\"type\":\"delete_group\",\"locator\":${locator},\"name\":$(printf '%s' "$group_name" | json_escape),\"id\":\"$id\"}" 2>/dev/null) || true
   local success
   success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
   if [[ "$success" == "true" ]]; then
+    if [[ -z "$1" ]] || should_use_current_mapping_for_title "$group_name"; then
+      tmux_clear_group_mapping
+    fi
     echo "Cleared group: $group_name"
   else
-    # deleting a missing group is fine for restore flows
     echo "Group missing or already clear: $group_name" >&2
   fi
 }
@@ -411,25 +535,42 @@ function cmd_import_group {
 
   [[ -z "$payload" ]] && return 0
 
-  # delete existing group first (best effort)
   cmd_clear_group "$group_name" >/dev/null 2>&1 || true
 
-  # restore tabs in saved order
-  local group_json
+  local group_json created=0
+  local update_current_mapping=0
+  if should_use_current_mapping_for_title "$group_name"; then
+    update_current_mapping=1
+  fi
   group_json=$(printf '%s' "$group_name" | json_escape)
   echo "$payload" | jq -r '.tabs[]?.url' | while IFS= read -r url; do
     [[ -z "$url" ]] && continue
-    local id
+    local id url_json response
     id=$(request_id)
-    local url_json
     url_json=$(printf '%s' "$url" | json_escape)
-    chrome_cmd "{\"type\":\"add_tab\",\"name\":${group_json},\"url\":${url_json},\"active\":false,\"id\":\"$id\"}" > /dev/null 2>&1 || true
+    response=$(chrome_cmd "{\"type\":\"add_tab\",\"name\":${group_json},\"url\":${url_json},\"active\":false,\"id\":\"$id\"}" 2>/dev/null || true)
+    if [[ $created -eq 0 && -n "$response" ]]; then
+      local success
+      success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+      if [[ "$success" == "true" ]]; then
+        local resolved_group_id resolved_window_id resolved_title
+        resolved_group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
+        resolved_window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
+        resolved_title=$(echo "$response" | jq -r '.data.group_title // empty' 2>/dev/null)
+        if [[ "$update_current_mapping" -eq 1 ]]; then
+          tmux_set_group_mapping "${resolved_title:-$group_name}" "$resolved_group_id" "$resolved_window_id"
+        fi
+        created=1
+      fi
+    fi
   done
 }
 
 function cmd_grab {
-  local group_name
-  group_name=$(tmux display-message -p '#W')
+  local group_name group_id window_id
+  group_name=$(tmux_current_window_title)
+  group_id=$(tmux_get_group_id)
+  window_id=$(tmux_get_group_window_id)
   local window_index
   window_index=$(tmux display-message -p '#{window_index}')
 
@@ -456,30 +597,36 @@ function cmd_grab {
     return 0
   fi
 
-  local count=0
-  local total
+  local count=0 total
   total=$(echo "$selected" | grep -c .)
-  local group_json
-  group_json=$(printf '%s' "$group_name" | json_escape)
+  local locator
+  locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
   while IFS= read -r url; do
     if [[ -n "$url" ]]; then
-      local id
+      local id active response
       id=$(request_id)
-      local url_json
-      url_json=$(printf '%s' "$url" | json_escape)
       ((count++))
-      local active="false"
+      active="false"
       if [[ "$count" -eq "$total" ]]; then
         active="true"
       fi
-      chrome_cmd "{\"type\":\"add_tab\",\"name\":${group_json},\"url\":${url_json},\"active\":${active},\"id\":\"$id\"}" > /dev/null
+      response=$(chrome_cmd "{\"type\":\"add_tab\",\"locator\":${locator},\"name\":$(printf '%s' "$group_name" | json_escape),\"url\":$(printf '%s' "$url" | json_escape),\"active\":${active},\"id\":\"$id\"}" 2>/dev/null || true)
+      if [[ -n "$response" ]]; then
+        local success
+        success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+        if [[ "$success" == "true" ]]; then
+          local resolved_group_id resolved_window_id resolved_title
+          resolved_group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
+          resolved_window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
+          resolved_title=$(echo "$response" | jq -r '.data.group_title // empty' 2>/dev/null)
+          tmux_set_group_mapping "${resolved_title:-$group_name}" "$resolved_group_id" "$resolved_window_id"
+          locator=$(build_group_locator_json "${resolved_title:-$group_name}" "$resolved_group_id" "$resolved_window_id")
+        fi
+      fi
     fi
   done <<< "$selected"
 
   echo "Added $count tab(s) to group '$group_name'"
-  # Raise Chrome to the foreground so the user sees the new tabs.
-  # The extension already focused the right Chrome window via active:true
-  # on the final add_tab; this just handles OS-level app activation.
   if [[ "$count" -gt 0 ]]; then
     cmd_focus chrome >/dev/null 2>&1 || true
   fi
@@ -487,23 +634,23 @@ function cmd_grab {
 
 function cmd_tabs {
   local all_flag=""
-  local group_name
-  group_name=$(tmux display-message -p '#W')
+  local group_name group_id window_id
+  group_name=$(tmux_current_window_title)
+  group_id=$(tmux_get_group_id)
+  window_id=$(tmux_get_group_window_id)
 
   if [[ "$1" == "--all" ]]; then
     all_flag="true"
   fi
 
-  local id
+  local id response locator
   id=$(request_id)
-  local response
-  local group_json
-  group_json=$(printf '%s' "$group_name" | json_escape)
+  locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
 
   if [[ -n "$all_flag" ]]; then
     response=$(chrome_cmd "{\"type\":\"get_tabs\",\"all\":true,\"id\":\"$id\"}")
   else
-    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"name\":${group_json},\"id\":\"$id\"}")
+    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"locator\":${locator},\"name\":$(printf '%s' "$group_name" | json_escape),\"id\":\"$id\"}")
   fi
 
   local success
@@ -535,27 +682,23 @@ function cmd_tabs {
     return 0
   fi
 
-  local tab_id
+  local tab_id focus_id
   tab_id=$(echo "$selected" | cut -f1)
-
-  local focus_id
   focus_id=$(request_id)
   chrome_cmd "{\"type\":\"focus_tab\",\"tab_id\":$tab_id,\"id\":\"$focus_id\"}" > /dev/null
   echo "Focused tab: $(echo "$selected" | cut -f2)"
 }
 
 function cmd_sync {
-  # Remove Chrome tab groups that no longer have a matching tmux window
   local tmux_windows
-  tmux_windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null)
+  tmux_windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null | while IFS= read -r w; do normalize_window_title "$w"; done)
   if [[ -z "$tmux_windows" ]]; then
     echo "Error: not in a tmux session" >&2
     return 1
   fi
 
-  local id
+  local id response
   id=$(request_id)
-  local response
   response=$(chrome_cmd "{\"type\":\"list_groups\",\"id\":\"$id\"}")
 
   local success
@@ -574,9 +717,7 @@ function cmd_sync {
       fi
       local del_id
       del_id=$(request_id)
-      local group_json
-      group_json=$(printf '%s' "$group_title" | json_escape)
-      chrome_cmd "{\"type\":\"delete_group\",\"name\":${group_json},\"id\":\"$del_id\"}" > /dev/null 2>&1
+      chrome_cmd "{\"type\":\"delete_group\",\"name\":$(printf '%s' "$group_title" | json_escape),\"id\":\"$del_id\"}" > /dev/null 2>&1
       echo "Removed orphan group: $group_title"
       ((removed++))
     fi
@@ -589,20 +730,43 @@ function cmd_sync {
   fi
 }
 
+function cmd_rebind_current_window {
+  local group_name id response success
+  group_name=$(tmux_current_window_title)
+  id=$(request_id)
+  response=$(chrome_cmd "{\"type\":\"pick_rebind_group\",\"id\":\"$id\"}")
+  success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+  if [[ "$success" != "true" ]]; then
+    echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    return 1
+  fi
+  local group_id window_id resolved_title source
+  group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
+  window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
+  resolved_title=$(echo "$response" | jq -r '.data.group_title // empty' 2>/dev/null)
+  source=$(echo "$response" | jq -r '.data.source // empty' 2>/dev/null)
+  if [[ -z "$group_id" ]]; then
+    echo "Error: no Chrome tab group available to bind" >&2
+    return 1
+  fi
+  tmux_set_group_mapping "$group_name" "$group_id" "$window_id"
+  echo "Rebound tmux window '$group_name' to Chrome group '${resolved_title:-$group_name}' (group_id=$group_id, source=$source)"
+}
+
 function cmd_picker {
   # Unified fzf picker: apps + current window's tab group tabs
   local apps="app\t[app] Chrome\napp\t[app] Slack\napp\t[app] Zoom\napp\t[app] Discord"
   local tabs_section=""
-  local group_name
-  group_name=$(tmux display-message -p '#W' 2>/dev/null)
+  local group_name group_id window_id
+  group_name=$(tmux_current_window_title 2>/dev/null)
+  group_id=$(tmux_get_group_id)
+  window_id=$(tmux_get_group_window_id)
 
   if [[ -S "$CHROME_BRIDGE_SOCKET" ]] && [[ -n "$group_name" ]]; then
-    local id
+    local id response locator
     id=$(request_id)
-    local response
-    local group_json
-    group_json=$(printf '%s' "$group_name" | json_escape)
-    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"name\":${group_json},\"id\":\"$id\"}" 2>/dev/null)
+    locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
+    response=$(chrome_cmd "{\"type\":\"get_tabs\",\"locator\":${locator},\"name\":$(printf '%s' "$group_name" | json_escape),\"id\":\"$id\"}" 2>/dev/null)
     local success
     success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
     if [[ "$success" == "true" ]]; then
@@ -811,10 +975,11 @@ function main {
     sync)    cmd_sync ;;
     merge)   cmd_merge ;;
     cycle-tab) cmd_cycle_tab "$@" ;;
+    rebind-current-window) cmd_rebind_current_window ;;
     picker)  cmd_picker ;;
     swap-window) cmd_swap_window ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|merge|cycle-tab|picker|swap-window}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|merge|cycle-tab|rebind-current-window|picker|swap-window}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -835,6 +1000,7 @@ function main {
       echo "  sync            Remove tab groups with no matching tmux window"
       echo "  merge           Merge all Chrome windows of this profile into one"
       echo "  cycle-tab {prev|next}  Cycle focus within the active tab group (wraps)"
+      echo "  rebind-current-window  Rebind this tmux window to the active Chrome group"
       echo "  swap-window     Swap current tmux terminal window geometry with active Chrome window"
       return 1
       ;;

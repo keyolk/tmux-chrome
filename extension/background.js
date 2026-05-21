@@ -2,7 +2,7 @@
 // Communicates with native messaging host to sync tab groups with tmux windows.
 // RULE: Never call chrome.windows.update({focused: true}) — terminal must keep focus.
 
-const BUILD_MARKER = "tmux-chrome-bridge:cycle-tab-2026-05-20";
+const BUILD_MARKER = "tmux-chrome-bridge:alnum-title-match-2026-05-22";
 console.log("[tmux-chrome] background loaded:", BUILD_MARKER);
 
 const NATIVE_HOST = "com.tmux.chrome.bridge";
@@ -17,6 +17,14 @@ let lastConnectTime = 0;
 // the tab the user was last on inside that group instead of always jumping
 // to the first tab.
 const lastActiveTabByGroup = new Map();
+
+let mutationQueue = Promise.resolve();
+
+function runSerialized(fn) {
+  const task = mutationQueue.then(fn, fn);
+  mutationQueue = task.catch(() => {});
+  return task;
+}
 
 function rememberActiveTabForGroup(groupId, tabId) {
   if (typeof groupId === "number" && groupId >= 0 && typeof tabId === "number") {
@@ -119,45 +127,70 @@ function sendToHost(msg) {
 async function handleMessage(msg) {
   switch (msg.type) {
     case "switch_window":
-      return switchWindow(msg.window_name);
+      return switchWindow(msg.window_name, msg.locator);
     case "create_group":
-      return createGroup(msg.name);
+      return runSerialized(() => createGroup(msg.name));
     case "delete_group":
-      return deleteGroup(msg.name);
+      return runSerialized(() => deleteGroup(msg.name, msg.locator));
     case "list_groups":
       return listGroups();
     case "add_tab":
-      return addTab(msg.name, msg.url, msg.active);
+      return runSerialized(() => addTab(msg.name, msg.url, msg.active, msg.locator));
     case "move_tab":
-      return moveTab(msg.name);
+      return runSerialized(() => moveTab(msg.name, msg.locator));
     case "remove_tab":
-      return removeTab();
+      return runSerialized(() => removeTab());
     case "get_tabs":
-      return getTabs(msg.name, msg.all, msg.active);
+      return getTabs(msg.name, msg.all, msg.active, msg.locator);
     case "focus_tab":
       return focusTab(msg.tab_id);
     case "raise_group_window":
-      return raiseGroupWindow(msg.name);
+      return raiseGroupWindow(msg.name, msg.group_id, msg.locator);
     case "raise_tab_window":
       return raiseTabWindow(msg.tab_id);
     case "rename_group":
-      return renameGroup(msg.old_name, msg.new_name);
+      return runSerialized(() => renameGroup(msg.old_name, msg.new_name, msg.locator));
     case "clean_tabs":
-      return cleanTabs();
+      return runSerialized(() => cleanTabs());
     case "merge_windows":
-      return mergeWindows();
+      return runSerialized(() => mergeWindows());
     case "cycle_tab_in_group":
       return cycleTabInGroup(msg.direction);
+    case "pick_rebind_group":
+      return pickRebindGroup();
     default:
       throw new Error(`Unknown message type: ${msg.type}`);
   }
 }
 
+function normalizeGroupTitle(title) {
+  if (typeof title !== "string") return "";
+  return title
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
 async function findGroupByTitle(title) {
   if (typeof title !== "string" || title.length === 0) return undefined;
-  const lower = title.toLowerCase();
+  const normalized = normalizeGroupTitle(title);
   const groups = await chrome.tabGroups.query({});
-  return groups.find((g) => typeof g.title === "string" && g.title.toLowerCase() === lower);
+  return groups.find((g) => normalizeGroupTitle(g.title || "") === normalized);
+}
+
+async function findGroupByLocator(locator = {}) {
+  if (locator && typeof locator.group_id === "number") {
+    try {
+      const group = await chrome.tabGroups.get(locator.group_id);
+      return group ?? undefined;
+    } catch (_) {
+      // stale id; fall through to title
+    }
+  }
+  if (locator && typeof locator.name === "string" && locator.name.length > 0) {
+    return findGroupByTitle(locator.name);
+  }
+  return undefined;
 }
 
 async function collapseAllExcept(expandGroupId) {
@@ -168,15 +201,15 @@ async function collapseAllExcept(expandGroupId) {
   await Promise.all(promises);
 }
 
-async function switchWindow(windowName) {
-  const group = await findGroupByTitle(windowName);
+async function switchWindow(windowName, locator) {
+  const group = await findGroupByLocator(locator) ?? await findGroupByTitle(windowName);
   if (!group) return { matched: false };
 
   await collapseAllExcept(group.id);
 
   const tabs = await chrome.tabs.query({ groupId: group.id });
   if (tabs.length === 0) {
-    return { matched: true, group_id: group.id };
+    return { matched: true, group_id: group.id, window_id: group.windowId, group_title: group.title || windowName };
   }
 
   const remembered = lastActiveTabByGroup.get(group.id);
@@ -185,7 +218,7 @@ async function switchWindow(windowName) {
   await chrome.tabs.update(target.id, { active: true });
   rememberActiveTabForGroup(group.id, target.id);
 
-  return { matched: true, group_id: group.id, tab_id: target.id };
+  return { matched: true, group_id: group.id, window_id: group.windowId, group_title: group.title || windowName, tab_id: target.id };
 }
 
 async function ensureReservedNativeGroup() {
@@ -210,20 +243,23 @@ async function createGroup(name) {
   return { group_id: groupId };
 }
 
-async function deleteGroup(name) {
+async function deleteGroup(name, locator) {
   if (name && name.toLowerCase() === RESERVED_GROUP_TITLE) {
     throw new Error(`Tab group "${RESERVED_GROUP_TITLE}" is reserved and cannot be deleted`);
   }
 
-  const group = await findGroupByTitle(name);
+  const group = await findGroupByLocator(locator) ?? await findGroupByTitle(name);
   if (!group) throw new Error(`Tab group "${name}" not found`);
 
-  // Ungroup all tabs in this group
+  if (name && group.title && group.title.toLowerCase() !== name.toLowerCase()) {
+    throw new Error(`Refusing to delete mismatched tab group: expected "${name}", resolved "${group.title}"`);
+  }
+
   const tabs = await chrome.tabs.query({ groupId: group.id });
   if (tabs.length > 0) {
     await chrome.tabs.ungroup(tabs.map((t) => t.id));
   }
-  return { ungrouped: tabs.length };
+  return { ungrouped: tabs.length, group_id: group.id, window_id: group.windowId, group_title: group.title || name };
 }
 
 async function listGroups() {
@@ -242,30 +278,26 @@ async function listGroups() {
   return result;
 }
 
-async function addTab(groupName, url, active = false) {
-  let group = await findGroupByTitle(groupName);
+async function addTab(groupName, url, active = false, locator) {
+  let group = await findGroupByLocator(locator) ?? await findGroupByTitle(groupName);
 
   let result;
-  // Create group if it doesn't exist
   if (!group) {
     const tab = await chrome.tabs.create({ url, active });
     const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-    await chrome.tabGroups.update(groupId, {
+    const created = await chrome.tabGroups.update(groupId, {
       title: groupName,
       collapsed: false,
     });
     await collapseAllExcept(groupId);
-    result = { group_id: groupId, tab_id: tab.id, window_id: tab.windowId, created_group: true };
+    result = { group_id: groupId, group_title: created.title || groupName, tab_id: tab.id, window_id: tab.windowId, created_group: true };
   } else {
-    // Add tab to existing group, in the same window the group lives in
     const tab = await chrome.tabs.create({ url, active, windowId: group.windowId });
     await chrome.tabs.group({ tabIds: [tab.id], groupId: group.id });
     await collapseAllExcept(group.id);
-    result = { group_id: group.id, tab_id: tab.id, window_id: group.windowId, created_group: false };
+    result = { group_id: group.id, group_title: group.title || groupName, tab_id: tab.id, window_id: group.windowId, created_group: false };
   }
 
-  // If the caller wants the new tab active, also raise the owning Chrome window
-  // within Chrome. OS-level app activation is handled by the CLI caller.
   if (active && result.window_id != null) {
     try {
       await chrome.windows.update(result.window_id, { focused: true });
@@ -276,10 +308,9 @@ async function addTab(groupName, url, active = false) {
   return result;
 }
 
-async function moveTab(groupName) {
-  let group = await findGroupByTitle(groupName);
+async function moveTab(groupName, locator) {
+  let group = await findGroupByLocator(locator) ?? await findGroupByTitle(groupName);
 
-  // Get active tab in the focused Chrome window
   const [activeTab] = await chrome.tabs.query({
     active: true,
     lastFocusedWindow: true,
@@ -287,19 +318,18 @@ async function moveTab(groupName) {
   if (!activeTab) throw new Error("No active tab found");
 
   if (!group) {
-    // Create group with the active tab
     const groupId = await chrome.tabs.group({ tabIds: [activeTab.id] });
-    await chrome.tabGroups.update(groupId, {
+    const created = await chrome.tabGroups.update(groupId, {
       title: groupName,
       collapsed: false,
     });
     await collapseAllExcept(groupId);
-    return { group_id: groupId, created_group: true };
+    return { group_id: groupId, group_title: created.title || groupName, window_id: activeTab.windowId, created_group: true };
   }
 
   await chrome.tabs.group({ tabIds: [activeTab.id], groupId: group.id });
   await collapseAllExcept(group.id);
-  return { group_id: group.id, created_group: false };
+  return { group_id: group.id, group_title: group.title || groupName, window_id: group.windowId, created_group: false };
 }
 
 async function removeTab() {
@@ -345,11 +375,10 @@ async function getActiveGroup() {
   return group ?? null;
 }
 
-async function getTabs(groupName, all, active) {
+async function getTabs(groupName, all, active, locator) {
   let tabs;
   let group = null;
   if (all) {
-    // All tabs across all groups
     const groups = await chrome.tabGroups.query({});
     tabs = [];
     for (const g of groups) {
@@ -371,7 +400,7 @@ async function getTabs(groupName, all, active) {
     group = await getActiveGroup();
     if (!group) throw new Error("No active tab group");
   } else {
-    group = await findGroupByTitle(groupName);
+    group = await findGroupByLocator(locator) ?? await findGroupByTitle(groupName);
     if (!group) throw new Error(`Tab group "${groupName}" not found`);
   }
 
@@ -409,12 +438,14 @@ async function raiseChromeWindow(windowId) {
   return { window_id: windowId };
 }
 
-async function raiseGroupWindow(name) {
-  const group = await findGroupByTitle(name);
+async function raiseGroupWindow(name, groupId, locator) {
+  const loc = locator ?? { group_id: groupId, name };
+  const group = await findGroupByLocator(loc) ?? await findGroupByTitle(name);
   if (!group) throw new Error(`Tab group "${name}" not found`);
   const tabs = await chrome.tabs.query({ groupId: group.id });
   if (tabs.length === 0) throw new Error(`Tab group "${name}" has no tabs`);
-  return raiseChromeWindow(tabs[0].windowId);
+  const raised = await raiseChromeWindow(tabs[0].windowId);
+  return { ...raised, group_id: group.id, group_title: group.title || name };
 }
 
 async function raiseTabWindow(tabId) {
@@ -422,12 +453,16 @@ async function raiseTabWindow(tabId) {
   return raiseChromeWindow(tab.windowId);
 }
 
-async function renameGroup(oldName, newName) {
-  const group = await findGroupByTitle(oldName);
+async function renameGroup(oldName, newName, locator) {
+  const group = await findGroupByLocator(locator) ?? await findGroupByTitle(oldName);
   if (!group) throw new Error(`Tab group "${oldName}" not found`);
 
-  await chrome.tabGroups.update(group.id, { title: newName });
-  return { group_id: group.id, old_name: oldName, new_name: newName };
+  if (oldName && group.title && group.title.toLowerCase() !== oldName.toLowerCase()) {
+    throw new Error(`Refusing to rename mismatched tab group: expected "${oldName}", resolved "${group.title}"`);
+  }
+
+  const updated = await chrome.tabGroups.update(group.id, { title: newName });
+  return { group_id: group.id, window_id: group.windowId, old_name: oldName, new_name: updated.title || newName };
 }
 
 async function cleanTabs() {
@@ -604,6 +639,36 @@ async function cycleTabInGroup(direction) {
     direction,
     index: nextIdx,
     total: tabs.length,
+  };
+}
+
+async function pickRebindGroup() {
+  const active = await getActiveGroup();
+  if (active) {
+    return { group_id: active.id, window_id: active.windowId, group_title: active.title || "(untitled)", source: "active_group" };
+  }
+
+  let chromeWindow = null;
+  try {
+    chromeWindow = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+  } catch (_) {
+    chromeWindow = null;
+  }
+  if (!chromeWindow) {
+    throw new Error("No focused Chrome window found");
+  }
+
+  const groups = await chrome.tabGroups.query({ windowId: chromeWindow.id });
+  if (!groups.length) {
+    throw new Error("No tab groups found in focused Chrome window");
+  }
+
+  const candidate = groups.find((g) => (g.title || "").toLowerCase() !== RESERVED_GROUP_TITLE) ?? groups[0];
+  return {
+    group_id: candidate.id,
+    window_id: candidate.windowId,
+    group_title: candidate.title || "(untitled)",
+    source: "focused_window_first_group",
   };
 }
 
