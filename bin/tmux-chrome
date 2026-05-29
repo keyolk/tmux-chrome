@@ -1,10 +1,19 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # tmux-chrome — CLI for tmux ↔ Chrome tab group bridge
 # Communicates with bridge.py via Unix socket at /tmp/tmux-chrome-bridge.sock
 
 set -eo pipefail
 
 CHROME_BRIDGE_SOCKET="/tmp/tmux-chrome-bridge.sock"
+
+# Where snapshots of the tab-group layout are written. Used both by the manual
+# `snapshot` command and automatically before any destructive `sync`.
+TMUX_CHROME_STATE_DIR="${TMUX_CHROME_STATE_DIR:-$HOME/.local/state/tmux-chrome}"
+
+# sync will refuse to ungroup more than this many groups at once unless given
+# --force-all. This is the guardrail against the "everything got scattered"
+# failure mode where a single bad sync wiped every group.
+SYNC_BULK_LIMIT="${TMUX_CHROME_SYNC_BULK_LIMIT:-2}"
 
 function chrome_cmd {
   local json="$1"
@@ -73,7 +82,7 @@ function should_use_current_mapping_for_title {
   local requested="$1"
   local current
   current=$(tmux_current_window_title)
-  [[ -n "$requested" && "$requested" == "$current" ]]
+  [[ -n "$requested" && "$(normalize_window_title "$requested")" == "$(normalize_window_title "$current")" ]]
 }
 
 function tmux_get_group_title {
@@ -92,10 +101,22 @@ function tmux_set_group_mapping {
   local title="$1"
   local group_id="$2"
   local window_id="$3"
-  tmux set-option -qw @chrome_group "$title" 2>/dev/null || true
-  [[ -n "$group_id" ]] && tmux set-option -qw @chrome_group_id "$group_id" 2>/dev/null || true
-  [[ -n "$window_id" ]] && tmux set-option -qw @chrome_window_id "$window_id" 2>/dev/null || true
-  debug_log "mapping set title='$title' group_id='${group_id:-}' window_id='${window_id:-}'"
+  local target="${4:-}"
+  local -a tflag=()
+  [[ -n "$target" ]] && tflag=(-t "$target")
+  tmux set-option -qw "${tflag[@]}" @chrome_group "$title" 2>/dev/null || true
+  [[ -n "$group_id" ]] && tmux set-option -qw "${tflag[@]}" @chrome_group_id "$group_id" 2>/dev/null || true
+  [[ -n "$window_id" ]] && tmux set-option -qw "${tflag[@]}" @chrome_window_id "$window_id" 2>/dev/null || true
+  debug_log "mapping set title='$title' group_id='${group_id:-}' window_id='${window_id:-}' target='${target:-current}'"
+}
+
+function tmux_clear_group_mapping_for {
+  local target="$1"
+  local -a tflag=()
+  [[ -n "$target" ]] && tflag=(-t "$target")
+  tmux set-option -quw "${tflag[@]}" @chrome_group 2>/dev/null || true
+  tmux set-option -quw "${tflag[@]}" @chrome_group_id 2>/dev/null || true
+  tmux set-option -quw "${tflag[@]}" @chrome_window_id 2>/dev/null || true
 }
 
 function tmux_clear_group_mapping {
@@ -106,6 +127,10 @@ function tmux_clear_group_mapping {
 }
 
 function tmux_current_window_title {
+  tmux display-message -p '#W' 2>/dev/null || true
+}
+
+function tmux_current_window_title_normalized {
   local raw
   raw=$(tmux display-message -p '#W' 2>/dev/null || true)
   normalize_window_title "$raw"
@@ -140,6 +165,42 @@ function build_group_locator_json {
 
 function current_frontmost_app {
   osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || true
+}
+
+# snapshot_groups — capture every Chrome tab group and its tabs to a JSON file
+# so the layout can be rebuilt after an accidental ungroup/sync. Prints the
+# path of the written snapshot on success and returns non-zero on failure.
+# Pass a path as $1 to control the destination; otherwise a timestamped file
+# is created under $TMUX_CHROME_STATE_DIR.
+function snapshot_groups {
+  local dest="${1:-}"
+  [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 1
+
+  local id response success
+  id=$(request_id)
+  response=$(chrome_cmd "{\"type\":\"get_tabs\",\"all\":true,\"id\":\"$id\"}" 2>/dev/null) || return 1
+  success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+  [[ "$success" == "true" ]] || return 1
+
+  if [[ -z "$dest" ]]; then
+    mkdir -p "$TMUX_CHROME_STATE_DIR" 2>/dev/null || return 1
+    dest="$TMUX_CHROME_STATE_DIR/snapshot-$(date +%Y%m%d-%H%M%S).json"
+  fi
+
+  # Reshape the flat tab list into { saved_at, groups: [ {title, tabs:[{url,title}]} ] }
+  # grouped by group_id so same-titled groups stay distinct.
+  if ! echo "$response" | jq \
+      --arg saved_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+      { saved_at: $saved_at,
+        groups: ( .data
+          | group_by(.group_id)
+          | map({ group_id: .[0].group_id,
+                  title: .[0].group_title,
+                  tabs: map({ url, title }) }) ) }' > "$dest" 2>/dev/null; then
+    return 1
+  fi
+
+  echo "$dest"
 }
 
 function ax_window_geometry {
@@ -213,7 +274,7 @@ function detect_tmux_terminal_app {
       fi
 
       pid="$ppid"
-      ((depth++))
+      ((depth++)) || true
     done
   fi
 
@@ -242,7 +303,7 @@ function cmd_reload {
   local tries=0
   while [[ ! -S "$CHROME_BRIDGE_SOCKET" ]] && [[ $tries -lt 15 ]]; do
     sleep 0.5
-    ((tries++))
+    ((tries++)) || true
   done
 
   if [[ -S "$CHROME_BRIDGE_SOCKET" ]]; then
@@ -253,40 +314,138 @@ function cmd_reload {
   fi
 }
 
+function ensure_group_title_matches {
+  local desired_name="$1"
+  local resolved_title="$2"
+  local resolved_group_id="$3"
+  local resolved_window_id="$4"
+
+  [[ -z "$desired_name" || -z "$resolved_title" ]] && return 0
+  [[ "$resolved_title" == "$desired_name" ]] && return 0
+  [[ "$(normalize_window_title "$resolved_title")" != "$(normalize_window_title "$desired_name")" ]] && return 0
+
+  local id locator
+  id=$(request_id)
+  locator=$(build_group_locator_json "$resolved_title" "$resolved_group_id" "$resolved_window_id")
+  chrome_cmd "{\"type\":\"rename_group\",\"old_name\":$(printf '%s' "$resolved_title" | json_escape),\"new_name\":$(printf '%s' "$desired_name" | json_escape),\"locator\":${locator},\"id\":\"$id\"}" >/dev/null 2>&1 || true
+}
+
+function cmd_rebind_all {
+  local dry_run=0
+  if [[ "${1:-}" == "--dry-run" ]]; then
+    dry_run=1
+  fi
+
+  [[ -S "$CHROME_BRIDGE_SOCKET" ]] || { echo "Error: Chrome bridge not running" >&2; return 1; }
+
+  local id response
+  id=$(request_id)
+  response=$(chrome_cmd "{\"type\":\"list_groups\",\"id\":\"$id\"}")
+  local success
+  success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+  if [[ "$success" != "true" ]]; then
+    echo "Error: $(echo "$response" | jq -r '.error // "list_groups failed"')" >&2
+    return 1
+  fi
+
+  declare -A GROUP_ID_BY_NORM
+  while IFS=$'\t' read -r gid title; do
+    [[ -z "$gid" || -z "$title" ]] && continue
+    local norm
+    norm=$(normalize_window_title "$title")
+    [[ -z "$norm" ]] && continue
+    GROUP_ID_BY_NORM["$norm"]="$gid"
+  done < <(echo "$response" | jq -r '.data[] | "\(.id)\t\(.title)"')
+
+  local bound=0 cleared=0
+  while IFS=$'\t' read -r session wi name; do
+    local target="$session:$wi"
+    local norm
+    norm=$(normalize_window_title "$name")
+    if [[ -n "${GROUP_ID_BY_NORM[$norm]:-}" ]]; then
+      local gid="${GROUP_ID_BY_NORM[$norm]}"
+      if [[ $dry_run -eq 1 ]]; then
+        printf 'BIND   %-22s name=%-30s gid=%s\n' "$target" "$name" "$gid"
+      else
+        tmux set-option -qw -t "$target" @chrome_group "$name"
+        tmux set-option -qw -t "$target" @chrome_group_id "$gid"
+        tmux set-option -quw -t "$target" @chrome_window_id
+        printf 'BIND   %-22s name=%-30s gid=%s\n' "$target" "$name" "$gid"
+      fi
+      ((bound++)) || true
+    else
+      if [[ $dry_run -eq 1 ]]; then
+        printf 'CLEAR  %-22s name=%-30s (no chrome group)\n' "$target" "$name"
+      else
+        tmux_clear_group_mapping_for "$target"
+        printf 'CLEAR  %-22s name=%-30s (no chrome group)\n' "$target" "$name"
+      fi
+      ((cleared++)) || true
+    fi
+  done < <(tmux list-windows -a -F '#{session_name}	#{window_index}	#W')
+
+  if [[ $dry_run -eq 1 ]]; then
+    echo ""
+    echo "(dry-run) would bind $bound, clear $cleared"
+  else
+    echo ""
+    echo "Bound $bound, cleared $cleared"
+  fi
+}
+
 function cmd_switch {
   local window_name="${1:-$(tmux_current_window_title)}"
-  local group_id window_id
-  group_id=$(tmux_get_group_id)
-  window_id=$(tmux_get_group_window_id)
   tmux set-option -qw @chrome_group "$window_name" 2>/dev/null
   [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 0
+
+  # switch is the periodic sync hook — tmux window name is the source of truth.
+  # Do NOT include the stale stored group_id/window_id in the locator: if the
+  # stored id now points at a different group, the extension would happily
+  # resolve to it and the response would overwrite @chrome_group with that
+  # wrong title, creating a self-reinforcing wrong binding. Match by title only.
   local id response locator
   id=$(request_id)
-  locator=$(build_group_locator_json "$window_name" "$group_id" "$window_id")
+  locator=$(build_group_locator_json "$window_name" "" "")
   response=$(chrome_cmd "{\"type\":\"switch_window\",\"window_name\":$(printf '%s' "$window_name" | json_escape),\"locator\":${locator},\"id\":\"$id\"}" 2>/dev/null || true)
   if [[ -n "$response" ]]; then
-    local success
+    local success matched
     success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
-    if [[ "$success" == "true" ]]; then
+    matched=$(echo "$response" | jq -r '.data.matched // false' 2>/dev/null)
+    if [[ "$success" == "true" && "$matched" == "true" ]]; then
       local resolved_group_id resolved_window_id resolved_title
       resolved_group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
       resolved_window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
       resolved_title=$(echo "$response" | jq -r '.data.group_title // empty' 2>/dev/null)
-      tmux_set_group_mapping "${resolved_title:-$window_name}" "$resolved_group_id" "$resolved_window_id"
+      # Refuse to update mapping if the resolved title doesn't normalize-match
+      # the tmux window name — guards against the extension matching some
+      # unrelated group by stale id even when we didn't send one.
+      if [[ -z "$resolved_title" ]] \
+         || [[ "$(normalize_window_title "$resolved_title")" == "$(normalize_window_title "$window_name")" ]]; then
+        tmux_set_group_mapping "$window_name" "$resolved_group_id" "$resolved_window_id"
+      else
+        # Mismatch: title doesn't match. Clear stored gid so we don't keep
+        # propagating bad state.
+        tmux set-option -quw @chrome_group_id 2>/dev/null || true
+        tmux set-option -quw @chrome_window_id 2>/dev/null || true
+      fi
+    else
+      # No matching Chrome group for this tmux window — clear any stale ids.
+      tmux set-option -quw @chrome_group_id 2>/dev/null || true
+      tmux set-option -quw @chrome_window_id 2>/dev/null || true
     fi
   fi
 }
 
 function cmd_rename {
   local old_name new_name group_id window_id
-  old_name=$(normalize_window_title "$(tmux_get_group_title)")
+  old_name=$(tmux_get_group_title)
   new_name=$(tmux_current_window_title)
   group_id=$(tmux_get_group_id)
   window_id=$(tmux_get_group_window_id)
 
   tmux set-option -qw @chrome_group "$new_name" 2>/dev/null
 
-  if [[ -z "$old_name" || "$old_name" == "$new_name" ]]; then
+  if [[ -z "$old_name" || "$(normalize_window_title "$old_name")" == "$(normalize_window_title "$new_name")" ]]; then
     return 0
   fi
 
@@ -382,6 +541,10 @@ function cmd_open {
     resolved_group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
     resolved_window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
     resolved_title=$(echo "$response" | jq -r '.data.group_title // empty' 2>/dev/null)
+    ensure_group_title_matches "$group_name" "$resolved_title" "$resolved_group_id" "$resolved_window_id"
+    if [[ -n "$group_name" ]]; then
+      resolved_title="$group_name"
+    fi
     tmux_set_group_mapping "${resolved_title:-$group_name}" "$resolved_group_id" "$resolved_window_id"
     echo "Opened in '${resolved_title:-$group_name}': $url"
     cmd_focus chrome >/dev/null 2>&1 || true
@@ -413,6 +576,10 @@ function cmd_add {
     resolved_group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
     resolved_window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
     resolved_title=$(echo "$response" | jq -r '.data.group_title // empty' 2>/dev/null)
+    ensure_group_title_matches "$group_name" "$resolved_title" "$resolved_group_id" "$resolved_window_id"
+    if [[ -n "$group_name" ]]; then
+      resolved_title="$group_name"
+    fi
     tmux_set_group_mapping "${resolved_title:-$group_name}" "$resolved_group_id" "$resolved_window_id"
     if [[ "$created" == "true" ]]; then
       echo "Created group '${resolved_title:-$group_name}' and added tab: $url"
@@ -519,10 +686,15 @@ function cmd_clear_group {
 }
 
 function cmd_import_group {
+  local target_window=""
+  if [[ "${1:-}" == "--target" ]]; then
+    target_window="$2"
+    shift 2
+  fi
   local group_name="$1"
   local source="${2:--}"
   if [[ -z "$group_name" ]]; then
-    echo "Usage: tmux-chrome import-group <group_name> [json-file|-]" >&2
+    echo "Usage: tmux-chrome import-group [--target <session:window>] <group_name> [json-file|-]" >&2
     return 1
   fi
 
@@ -537,13 +709,21 @@ function cmd_import_group {
 
   cmd_clear_group "$group_name" >/dev/null 2>&1 || true
 
+  # Clear any stale binding on the target window up-front; we'll re-set it
+  # after the first add_tab response comes back with the fresh group_id.
+  if [[ -n "$target_window" ]]; then
+    tmux_clear_group_mapping_for "$target_window"
+  fi
+
   local group_json created=0
-  local update_current_mapping=0
-  if should_use_current_mapping_for_title "$group_name"; then
-    update_current_mapping=1
+  local update_mapping=0
+  if [[ -n "$target_window" ]]; then
+    update_mapping=1
+  elif should_use_current_mapping_for_title "$group_name"; then
+    update_mapping=1
   fi
   group_json=$(printf '%s' "$group_name" | json_escape)
-  echo "$payload" | jq -r '.tabs[]?.url' | while IFS= read -r url; do
+  while IFS= read -r url; do
     [[ -z "$url" ]] && continue
     local id url_json response
     id=$(request_id)
@@ -557,13 +737,13 @@ function cmd_import_group {
         resolved_group_id=$(echo "$response" | jq -r '.data.group_id // empty' 2>/dev/null)
         resolved_window_id=$(echo "$response" | jq -r '.data.window_id // empty' 2>/dev/null)
         resolved_title=$(echo "$response" | jq -r '.data.group_title // empty' 2>/dev/null)
-        if [[ "$update_current_mapping" -eq 1 ]]; then
-          tmux_set_group_mapping "${resolved_title:-$group_name}" "$resolved_group_id" "$resolved_window_id"
+        if [[ "$update_mapping" -eq 1 ]]; then
+          tmux_set_group_mapping "$group_name" "$resolved_group_id" "$resolved_window_id" "$target_window"
         fi
         created=1
       fi
     fi
-  done
+  done < <(echo "$payload" | jq -r '.tabs[]?.url')
 }
 
 function cmd_grab {
@@ -605,7 +785,7 @@ function cmd_grab {
     if [[ -n "$url" ]]; then
       local id active response
       id=$(request_id)
-      ((count++))
+      ((count++)) || true
       active="false"
       if [[ "$count" -eq "$total" ]]; then
         active="true"
@@ -690,8 +870,30 @@ function cmd_tabs {
 }
 
 function cmd_sync {
+  # cmd_sync reconciles Chrome tab groups against tmux windows. Historically it
+  # *ungrouped* every Chrome group with no matching tmux window — and because
+  # the tmux `window-unlinked` hook calls it on every window close, a single
+  # mismatch (renamed window, group owned by another session, etc.) could
+  # scatter every tab out of its group at once. It is now report-only by
+  # default and heavily guarded:
+  #   * windows from ALL tmux sessions are considered (not just the current one)
+  #   * nothing is deleted without --force
+  #   * a full snapshot is written before any deletion, so it can be restored
+  #   * deleting more than $SYNC_BULK_LIMIT groups needs --force-all (blast-radius cap)
+  local force=0 force_all=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force)     force=1 ;;
+      --force-all) force=1; force_all=1 ;;
+      *) echo "Unknown sync option: $1" >&2; return 1 ;;
+    esac
+    shift
+  done
+
   local tmux_windows
-  tmux_windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null | while IFS= read -r w; do normalize_window_title "$w"; done)
+  # -a: every window in every session. The owning session may not be the one
+  # that triggered the hook, and those groups are NOT orphans.
+  tmux_windows=$(tmux list-windows -a -F '#{window_name}' 2>/dev/null | while IFS= read -r w; do normalize_window_title "$w"; done)
   if [[ -z "$tmux_windows" ]]; then
     echo "Error: not in a tmux session" >&2
     return 1
@@ -708,26 +910,157 @@ function cmd_sync {
     return 1
   fi
 
-  local removed=0
+  # First pass: collect orphan group titles (groups with no matching tmux window).
+  local -a orphans=()
   while IFS= read -r group_title; do
     [[ -z "$group_title" ]] && continue
-    if ! echo "$tmux_windows" | grep -qxF "$group_title"; then
-      if [[ "$group_title" == "native" ]]; then
-        continue
-      fi
-      local del_id
-      del_id=$(request_id)
-      chrome_cmd "{\"type\":\"delete_group\",\"name\":$(printf '%s' "$group_title" | json_escape),\"id\":\"$del_id\"}" > /dev/null 2>&1
-      echo "Removed orphan group: $group_title"
-      ((removed++))
+    local group_title_norm
+    group_title_norm=$(normalize_window_title "$group_title")
+    [[ "$group_title_norm" == "native" ]] && continue
+    if ! echo "$tmux_windows" | grep -qxF "$group_title_norm"; then
+      orphans+=("$group_title")
     fi
   done < <(echo "$response" | jq -r '.data[].title')
 
-  if [[ $removed -eq 0 ]]; then
+  if [[ ${#orphans[@]} -eq 0 ]]; then
     echo "No orphan tab groups found"
-  else
-    echo "Removed $removed orphan group(s)"
+    return 0
   fi
+
+  # Report-only mode (the default, and what the tmux hook hits). NEVER deletes.
+  if [[ $force -eq 0 ]]; then
+    echo "Found ${#orphans[@]} orphan group(s) with no matching tmux window:"
+    local g
+    for g in "${orphans[@]}"; do
+      echo "  - $g"
+    done
+    echo ""
+    echo "Nothing was changed. To ungroup them: tmux-chrome sync --force"
+    [[ ${#orphans[@]} -gt $SYNC_BULK_LIMIT ]] && \
+      echo "(${#orphans[@]} > $SYNC_BULK_LIMIT groups — that would need --force-all)"
+    return 0
+  fi
+
+  # Blast-radius cap: refuse to ungroup a large number of groups in one shot
+  # unless the user explicitly asked for it. This is the guardrail that would
+  # have prevented the "every group got scattered" incident.
+  if [[ ${#orphans[@]} -gt $SYNC_BULK_LIMIT && $force_all -eq 0 ]]; then
+    echo "Refusing to ungroup ${#orphans[@]} groups at once (limit $SYNC_BULK_LIMIT)." >&2
+    echo "This looks like a mass wipe. If you really mean it: tmux-chrome sync --force-all" >&2
+    echo "Affected groups:" >&2
+    local g
+    for g in "${orphans[@]}"; do echo "  - $g" >&2; done
+    return 1
+  fi
+
+  # Snapshot before mutating so an accidental sync can be undone.
+  local snap
+  snap=$(snapshot_groups) && [[ -n "$snap" ]] && echo "Snapshot saved: $snap (restore with: tmux-chrome restore '$snap')"
+
+  local removed=0 g
+  for g in "${orphans[@]}"; do
+    local del_id
+    del_id=$(request_id)
+    chrome_cmd "{\"type\":\"delete_group\",\"name\":$(printf '%s' "$g" | json_escape),\"id\":\"$del_id\"}" > /dev/null 2>&1
+    echo "Removed orphan group: $g"
+    ((removed++)) || true
+  done
+
+  echo "Ungrouped $removed orphan group(s)"
+}
+
+# cmd_snapshot — manually capture the current tab-group layout to disk.
+function cmd_snapshot {
+  local dest="${1:-}"
+  if [[ ! -S "$CHROME_BRIDGE_SOCKET" ]]; then
+    echo "Error: Chrome bridge not running" >&2
+    return 1
+  fi
+  local path
+  path=$(snapshot_groups "$dest")
+  if [[ -z "$path" ]]; then
+    echo "Error: snapshot failed" >&2
+    return 1
+  fi
+  local n
+  n=$(jq -r '.groups | length' "$path" 2>/dev/null || echo "?")
+  echo "Saved $n group(s) to $path"
+}
+
+# cmd_restore — rebuild tab groups from a snapshot. Because an accidental
+# ungroup/sync leaves the tabs OPEN (just detached from their group), the
+# default behavior re-groups existing loose tabs by matching URL instead of
+# opening duplicates. Tabs that are genuinely gone are skipped unless
+# --reopen-missing is passed.
+function cmd_restore {
+  local reopen_missing=0 file=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reopen-missing) reopen_missing=1 ;;
+      *) file="$1" ;;
+    esac
+    shift
+  done
+
+  if [[ ! -S "$CHROME_BRIDGE_SOCKET" ]]; then
+    echo "Error: Chrome bridge not running" >&2
+    return 1
+  fi
+
+  # Default to the most recent snapshot if none specified.
+  if [[ -z "$file" ]]; then
+    file=$(ls -1t "$TMUX_CHROME_STATE_DIR"/snapshot-*.json 2>/dev/null | head -1)
+    if [[ -z "$file" ]]; then
+      echo "Usage: tmux-chrome restore [--reopen-missing] <snapshot.json>" >&2
+      echo "No snapshots found in $TMUX_CHROME_STATE_DIR" >&2
+      return 1
+    fi
+    echo "Restoring from latest snapshot: $file"
+  fi
+
+  if [[ ! -f "$file" ]]; then
+    echo "Error: snapshot not found: $file" >&2
+    return 1
+  fi
+
+  local ngroups
+  ngroups=$(jq -r '.groups | length' "$file" 2>/dev/null)
+  if [[ -z "$ngroups" || "$ngroups" == "null" ]]; then
+    echo "Error: not a valid snapshot file: $file" >&2
+    return 1
+  fi
+
+  local regrouped=0 reopened=0 group_count=0
+  # Iterate groups; for each, send a regroup_tabs request listing the saved URLs.
+  while IFS= read -r group_obj; do
+    local title urls_json
+    title=$(echo "$group_obj" | jq -r '.title // empty')
+    [[ -z "$title" ]] && continue
+    [[ "$(normalize_window_title "$title")" == "native" ]] && continue
+    urls_json=$(echo "$group_obj" | jq -c '[.tabs[]?.url]')
+    [[ "$urls_json" == "[]" ]] && continue
+
+    local id response success
+    id=$(request_id)
+    response=$(chrome_cmd "{\"type\":\"regroup_tabs\",\"name\":$(printf '%s' "$title" | json_escape),\"urls\":${urls_json},\"reopen_missing\":$([[ $reopen_missing -eq 1 ]] && echo true || echo false),\"id\":\"$id\"}" 2>/dev/null) || true
+    success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
+    if [[ "$success" == "true" ]]; then
+      local rg ro
+      rg=$(echo "$response" | jq -r '.data.regrouped // 0' 2>/dev/null)
+      ro=$(echo "$response" | jq -r '.data.reopened // 0' 2>/dev/null)
+      ((regrouped += rg)) || true
+      ((reopened += ro)) || true
+      ((group_count++)) || true
+      echo "Restored '$title': regrouped $rg tab(s)$([[ "$ro" -gt 0 ]] && echo ", reopened $ro")"
+    else
+      echo "Warning: could not restore '$title': $(echo "$response" | jq -r '.error // "unknown"')" >&2
+    fi
+  done < <(jq -c '.groups[]?' "$file")
+
+  echo ""
+  echo "Restored $group_count group(s): regrouped $regrouped existing tab(s), reopened $reopened missing tab(s)"
+  [[ $reopen_missing -eq 0 && $reopened -eq 0 ]] && \
+    echo "(loose tabs that were closed are skipped; add --reopen-missing to reopen them)"
 }
 
 function cmd_rebind_current_window {
@@ -972,14 +1305,17 @@ function main {
     rename)  cmd_rename ;;
     reload)  cmd_reload ;;
     clean)   cmd_clean ;;
-    sync)    cmd_sync ;;
+    sync)    cmd_sync "$@" ;;
+    snapshot) cmd_snapshot "$@" ;;
+    restore) cmd_restore "$@" ;;
     merge)   cmd_merge ;;
     cycle-tab) cmd_cycle_tab "$@" ;;
     rebind-current-window) cmd_rebind_current_window ;;
+    rebind-all) cmd_rebind_all "$@" ;;
     picker)  cmd_picker ;;
     swap-window) cmd_swap_window ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|merge|cycle-tab|rebind-current-window|picker|swap-window}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|snapshot|restore|merge|cycle-tab|rebind-current-window|rebind-all|picker|swap-window}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -997,10 +1333,13 @@ function main {
       echo "  tabs [--all]    Browse tabs in group via fzf → focus selected"
       echo "  reload          Restart Chrome extension and reconnect bridge"
       echo "  clean           Close all tabs not belonging to any tab group"
-      echo "  sync            Remove tab groups with no matching tmux window"
+      echo "  sync [--force|--force-all]  Report tab groups with no matching tmux window (report-only by default; --force ungroups them, --force-all lifts the bulk cap)"
+      echo "  snapshot [file] Save the current tab-group layout to JSON (for restore)"
+      echo "  restore [--reopen-missing] [file]  Rebuild groups from a snapshot (latest if omitted); re-groups existing loose tabs by URL"
       echo "  merge           Merge all Chrome windows of this profile into one"
       echo "  cycle-tab {prev|next}  Cycle focus within the active tab group (wraps)"
       echo "  rebind-current-window  Rebind this tmux window to the active Chrome group"
+      echo "  rebind-all [--dry-run] Rebind every tmux window's @chrome_group* options to matching Chrome groups by title"
       echo "  swap-window     Swap current tmux terminal window geometry with active Chrome window"
       return 1
       ;;

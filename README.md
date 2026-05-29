@@ -68,7 +68,11 @@ tmux-chrome add <url>            # Add URL to current window's group (auto-creat
 tmux-chrome move                 # Move Chrome's active tab into current window's group
 tmux-chrome remove               # Remove Chrome's active tab from its group
 tmux-chrome clean                # Close all tabs that aren't in any tab group
-tmux-chrome sync                 # Remove tab groups with no matching tmux window
+tmux-chrome sync                 # REPORT tab groups with no matching tmux window (read-only)
+tmux-chrome sync --force         # …and ungroup them (snapshots first; caps bulk wipes)
+tmux-chrome snapshot             # Save the current tab-group layout to JSON
+tmux-chrome restore              # Rebuild groups from the latest snapshot (re-groups loose tabs by URL)
+tmux-chrome restore <file>       # Rebuild from a specific snapshot
 
 # Interactive
 tmux-chrome grab                 # Extract URLs from tmux panes → fzf multi-select → add to group
@@ -147,6 +151,28 @@ The saved layout file under `~/.config/tmux/layouts/*.json` will include an opti
 - **No focus stealing**: The extension never calls `chrome.windows.update({focused: true})`. It only sets tabs as active in the background.
 - **Profile scoping**: Install the Chrome extension only in the profile you want to control. Other profiles are unaffected.
 - **Native messaging keepalive**: The persistent native messaging port keeps the MV3 service worker alive — no polling or alarms needed.
+
+## Safety & recovery
+
+`sync` used to ungroup every Chrome group that didn't match a tmux window, with
+no confirmation — so a single mismatch (or the `window-unlinked` hook firing on a
+window close) could scatter every tab out of its group at once. It is now:
+
+- **Report-only by default.** Plain `sync` (and the tmux hook) only *list* orphans.
+  Ungrouping requires an explicit `sync --force`.
+- **All-session aware.** Windows from every tmux session count, so a group owned
+  by another session is never treated as an orphan.
+- **Snapshotted before mutation.** `--force` writes a snapshot to
+  `~/.local/state/tmux-chrome/` before touching anything.
+- **Bulk-wipe capped.** Ungrouping more than `TMUX_CHROME_SYNC_BULK_LIMIT`
+  (default 2) groups at once is refused unless you pass `sync --force-all`.
+
+If groups ever get scattered, the tabs stay **open** (ungroup ≠ close). Recover with:
+
+```bash
+tmux-chrome restore                  # re-group loose tabs by URL from the latest snapshot
+tmux-chrome restore --reopen-missing # also reopen tabs that were since closed
+```
 
 ## Dependencies
 

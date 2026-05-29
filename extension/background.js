@@ -2,7 +2,7 @@
 // Communicates with native messaging host to sync tab groups with tmux windows.
 // RULE: Never call chrome.windows.update({focused: true}) — terminal must keep focus.
 
-const BUILD_MARKER = "tmux-chrome-bridge:alnum-title-match-2026-05-22";
+const BUILD_MARKER = "tmux-chrome-bridge:regroup-restore-2026-05-29";
 console.log("[tmux-chrome] background loaded:", BUILD_MARKER);
 
 const NATIVE_HOST = "com.tmux.chrome.bridge";
@@ -152,6 +152,8 @@ async function handleMessage(msg) {
       return runSerialized(() => renameGroup(msg.old_name, msg.new_name, msg.locator));
     case "clean_tabs":
       return runSerialized(() => cleanTabs());
+    case "regroup_tabs":
+      return runSerialized(() => regroupTabs(msg.name, msg.urls, msg.reopen_missing));
     case "merge_windows":
       return runSerialized(() => mergeWindows());
     case "cycle_tab_in_group":
@@ -251,7 +253,7 @@ async function deleteGroup(name, locator) {
   const group = await findGroupByLocator(locator) ?? await findGroupByTitle(name);
   if (!group) throw new Error(`Tab group "${name}" not found`);
 
-  if (name && group.title && group.title.toLowerCase() !== name.toLowerCase()) {
+  if (name && group.title && normalizeGroupTitle(group.title) !== normalizeGroupTitle(name)) {
     throw new Error(`Refusing to delete mismatched tab group: expected "${name}", resolved "${group.title}"`);
   }
 
@@ -292,6 +294,10 @@ async function addTab(groupName, url, active = false, locator) {
     await collapseAllExcept(groupId);
     result = { group_id: groupId, group_title: created.title || groupName, tab_id: tab.id, window_id: tab.windowId, created_group: true };
   } else {
+    if (groupName && group.title !== groupName) {
+      const updated = await chrome.tabGroups.update(group.id, { title: groupName });
+      group = updated ?? group;
+    }
     const tab = await chrome.tabs.create({ url, active, windowId: group.windowId });
     await chrome.tabs.group({ tabIds: [tab.id], groupId: group.id });
     await collapseAllExcept(group.id);
@@ -457,7 +463,7 @@ async function renameGroup(oldName, newName, locator) {
   const group = await findGroupByLocator(locator) ?? await findGroupByTitle(oldName);
   if (!group) throw new Error(`Tab group "${oldName}" not found`);
 
-  if (oldName && group.title && group.title.toLowerCase() !== oldName.toLowerCase()) {
+  if (oldName && group.title && normalizeGroupTitle(group.title) !== normalizeGroupTitle(oldName)) {
     throw new Error(`Refusing to rename mismatched tab group: expected "${oldName}", resolved "${group.title}"`);
   }
 
@@ -487,6 +493,83 @@ async function cleanTabs() {
   }
 
   return { moved: tabIds.length, group: RESERVED_GROUP_TITLE };
+}
+
+// regroupTabs — rebuild a tab group from a list of URLs captured in a snapshot.
+// This is the inverse of an accidental ungroup: when a group is dissolved the
+// tabs stay OPEN but lose their group membership, so we find those still-open
+// loose tabs by URL and re-group them under the original title rather than
+// opening duplicates. URLs with no matching open tab are only reopened when
+// reopenMissing is true. Existing tabs that are already in a correctly-titled
+// group are left alone (idempotent re-runs).
+async function regroupTabs(title, urls, reopenMissing = false) {
+  if (typeof title !== "string" || title.length === 0) {
+    throw new Error("regroup_tabs requires a group title");
+  }
+  if (!Array.isArray(urls) || urls.length === 0) {
+    return { regrouped: 0, reopened: 0, group_title: title };
+  }
+
+  // Tabs already in a same-titled group are considered satisfied — don't move
+  // or duplicate them.
+  const existingGroup = await findGroupByTitle(title);
+  const alreadyGrouped = new Set();
+  if (existingGroup) {
+    const inGroup = await chrome.tabs.query({ groupId: existingGroup.id });
+    for (const t of inGroup) alreadyGrouped.add(t.url);
+  }
+
+  // Index currently-loose tabs (not in any group) by URL so we can claim them.
+  const allTabs = await chrome.tabs.query({});
+  const looseByUrl = new Map();
+  for (const t of allTabs) {
+    if (t.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE && typeof t.url === "string") {
+      if (!looseByUrl.has(t.url)) looseByUrl.set(t.url, []);
+      looseByUrl.get(t.url).push(t);
+    }
+  }
+
+  const tabIdsToGroup = [];
+  let reopened = 0;
+  const missing = [];
+
+  for (const url of urls) {
+    if (typeof url !== "string" || url.length === 0) continue;
+    if (alreadyGrouped.has(url)) continue;
+
+    const pool = looseByUrl.get(url);
+    if (pool && pool.length > 0) {
+      const tab = pool.shift(); // claim one loose tab per saved URL
+      tabIdsToGroup.push(tab.id);
+    } else if (reopenMissing) {
+      const tab = await chrome.tabs.create({ url, active: false });
+      tabIdsToGroup.push(tab.id);
+      reopened += 1;
+    } else {
+      missing.push(url);
+    }
+  }
+
+  if (tabIdsToGroup.length === 0) {
+    return { regrouped: 0, reopened: 0, missing: missing.length, group_title: title, group_id: existingGroup?.id };
+  }
+
+  let groupId;
+  if (existingGroup) {
+    await chrome.tabs.group({ tabIds: tabIdsToGroup, groupId: existingGroup.id });
+    groupId = existingGroup.id;
+  } else {
+    groupId = await chrome.tabs.group({ tabIds: tabIdsToGroup });
+    await chrome.tabGroups.update(groupId, { title, collapsed: true });
+  }
+
+  return {
+    regrouped: tabIdsToGroup.length - reopened,
+    reopened,
+    missing: missing.length,
+    group_id: groupId,
+    group_title: title,
+  };
 }
 
 // mergeWindows — collapse all normal Chrome windows of this profile into the
