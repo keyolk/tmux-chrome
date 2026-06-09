@@ -687,14 +687,18 @@ function cmd_clear_group {
 
 function cmd_import_group {
   local target_window=""
-  if [[ "${1:-}" == "--target" ]]; then
-    target_window="$2"
-    shift 2
-  fi
+  local force=0
+  while [[ $# -gt 0 ]]; do
+    case "${1:-}" in
+      --target) target_window="$2"; shift 2 ;;
+      --force)  force=1; shift ;;
+      *) break ;;
+    esac
+  done
   local group_name="$1"
   local source="${2:--}"
   if [[ -z "$group_name" ]]; then
-    echo "Usage: tmux-chrome import-group [--target <session:window>] <group_name> [json-file|-]" >&2
+    echo "Usage: tmux-chrome import-group [--target <session:window>] [--force] <group_name> [json-file|-]" >&2
     return 1
   fi
 
@@ -706,6 +710,48 @@ function cmd_import_group {
   fi
 
   [[ -z "$payload" ]] && return 0
+
+  # Skip if a matching Chrome group already exists with tabs, unless --force
+  # was explicitly requested. This prevents `tmux.sh load` from destroying a
+  # live Chrome group that already matches a restored tmux window.
+  if [[ $force -eq 0 ]]; then
+    local existing_id existing_response existing_count
+    existing_id=$(request_id)
+    existing_response=$(chrome_cmd "{\"type\":\"list_groups\",\"id\":\"$existing_id\"}" 2>/dev/null || true)
+    if [[ -n "$existing_response" ]]; then
+      existing_count=$(echo "$existing_response" \
+        | jq --arg name "$group_name" '
+            [ .data[]?
+              | select(
+                  (.title // "" | ascii_downcase | gsub("[^a-z0-9]+"; ""))
+                  == ($name | ascii_downcase | gsub("[^a-z0-9]+"; ""))
+                )
+              | .tab_count // 0
+            ] | add // 0
+          ' 2>/dev/null || echo 0)
+      if [[ -n "$existing_count" && "$existing_count" =~ ^[0-9]+$ && "$existing_count" -gt 0 ]]; then
+        # Group exists and is non-empty — leave it alone, but still update the
+        # tmux→group binding so the target window points at the live group.
+        if [[ -n "$target_window" ]]; then
+          local resolved_group_id resolved_window_id
+          resolved_group_id=$(echo "$existing_response" \
+            | jq -r --arg name "$group_name" '
+                .data[]?
+                | select(
+                    (.title // "" | ascii_downcase | gsub("[^a-z0-9]+"; ""))
+                    == ($name | ascii_downcase | gsub("[^a-z0-9]+"; ""))
+                  )
+                | .id
+              ' 2>/dev/null | head -1)
+          if [[ -n "$resolved_group_id" ]]; then
+            tmux_set_group_mapping "$group_name" "$resolved_group_id" "" "$target_window"
+          fi
+        fi
+        debug_log "import-group: skipping '$group_name' (already exists with $existing_count tab(s)); pass --force to overwrite"
+        return 0
+      fi
+    fi
+  fi
 
   cmd_clear_group "$group_name" >/dev/null 2>&1 || true
 
@@ -880,11 +926,12 @@ function cmd_sync {
   #   * nothing is deleted without --force
   #   * a full snapshot is written before any deletion, so it can be restored
   #   * deleting more than $SYNC_BULK_LIMIT groups needs --force-all (blast-radius cap)
-  local force=0 force_all=0
+  local force=0 force_all=0 quiet=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --force)     force=1 ;;
       --force-all) force=1; force_all=1 ;;
+      --quiet|-q)  quiet=1 ;;
       *) echo "Unknown sync option: $1" >&2; return 1 ;;
     esac
     shift
@@ -923,12 +970,15 @@ function cmd_sync {
   done < <(echo "$response" | jq -r '.data[].title')
 
   if [[ ${#orphans[@]} -eq 0 ]]; then
-    echo "No orphan tab groups found"
+    [[ $quiet -eq 0 ]] && echo "No orphan tab groups found"
     return 0
   fi
 
   # Report-only mode (the default, and what the tmux hook hits). NEVER deletes.
   if [[ $force -eq 0 ]]; then
+    if [[ $quiet -eq 1 ]]; then
+      return 0
+    fi
     echo "Found ${#orphans[@]} orphan group(s) with no matching tmux window:"
     local g
     for g in "${orphans[@]}"; do
@@ -1327,13 +1377,13 @@ function main {
       echo "  move            Move Chrome's active tab to current window's group"
       echo "  remove          Remove Chrome's active tab from its group"
       echo "  export-group    Export one tab group as JSON"
-      echo "  import-group    Import one tab group from JSON"
+      echo "  import-group    Import one tab group from JSON (skips if a matching Chrome group already exists; pass --force to overwrite)"
       echo "  clear-group     Delete one named tab group"
       echo "  grab            Extract URLs from panes → fzf → add to tab group"
       echo "  tabs [--all]    Browse tabs in group via fzf → focus selected"
       echo "  reload          Restart Chrome extension and reconnect bridge"
       echo "  clean           Close all tabs not belonging to any tab group"
-      echo "  sync [--force|--force-all]  Report tab groups with no matching tmux window (report-only by default; --force ungroups them, --force-all lifts the bulk cap)"
+      echo "  sync [--force|--force-all] [--quiet]  Report tab groups with no matching tmux window (report-only by default; --force ungroups them, --force-all lifts the bulk cap, --quiet suppresses no-op output for hook use)"
       echo "  snapshot [file] Save the current tab-group layout to JSON (for restore)"
       echo "  restore [--reopen-missing] [file]  Rebuild groups from a snapshot (latest if omitted); re-groups existing loose tabs by URL"
       echo "  merge           Merge all Chrome windows of this profile into one"
