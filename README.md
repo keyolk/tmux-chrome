@@ -61,7 +61,8 @@ tmux-chrome switch               # Switch to group matching current tmux window
 tmux-chrome list                 # List all tab groups
 tmux-chrome delete               # Delete current window's tab group
 tmux-chrome export-group <name>  # Export one group as JSON
-tmux-chrome import-group <name>  # Import one group from JSON stdin/file
+tmux-chrome import-group <name>  # Import one group from JSON stdin/file (skips if a live group already matches)
+tmux-chrome import-group --force <name>  # …overwrite an existing matching Chrome group
 
 # Tab management
 tmux-chrome add <url>            # Add URL to current window's group (auto-creates group)
@@ -69,6 +70,7 @@ tmux-chrome move                 # Move Chrome's active tab into current window'
 tmux-chrome remove               # Remove Chrome's active tab from its group
 tmux-chrome clean                # Close all tabs that aren't in any tab group
 tmux-chrome sync                 # REPORT tab groups with no matching tmux window (read-only)
+tmux-chrome sync --quiet         # …same, but suppress no-op output (for tmux hooks)
 tmux-chrome sync --force         # …and ungroup them (snapshots first; caps bulk wipes)
 tmux-chrome snapshot             # Save the current tab-group layout to JSON
 tmux-chrome restore              # Rebuild groups from the latest snapshot (re-groups loose tabs by URL)

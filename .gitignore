@@ -1,3 +1,5 @@
 node_modules/
 raycast/.eslintrc.json
 *.bun
+__pycache__/
+*.pyc

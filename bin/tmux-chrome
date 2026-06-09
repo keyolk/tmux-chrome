@@ -66,8 +66,8 @@ function debug_log {
 
 function normalize_window_title {
   local title="$1"
-  title="${title#${WORKING_PREFIX}}"
-  title="${title#${DONE_PREFIX}}"
+  title="${title#"$WORKING_PREFIX"}"
+  title="${title#"$DONE_PREFIX"}"
   title="${title# }"
   python3 -c '
 import re, sys, unicodedata
@@ -1324,7 +1324,7 @@ APPLESCRIPT
 APPLESCRIPT
 
   tmux refresh-client -S >/dev/null 2>&1 || true
-  tmux refresh-client -C ${chrome_width}x${chrome_height} >/dev/null 2>&1 || true
+  tmux refresh-client -C "${chrome_width}x${chrome_height}" >/dev/null 2>&1 || true
 
   if [[ -n "$previous_app" ]]; then
     cmd_focus "$previous_app" >/dev/null 2>&1 || true
