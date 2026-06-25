@@ -15,6 +15,15 @@ TMUX_CHROME_STATE_DIR="${TMUX_CHROME_STATE_DIR:-$HOME/.local/state/tmux-chrome}"
 # failure mode where a single bad sync wiped every group.
 SYNC_BULK_LIMIT="${TMUX_CHROME_SYNC_BULK_LIMIT:-2}"
 
+# Resolve all per-window tmux options/queries against the pane that invoked
+# tmux-chrome ($TMUX_PANE), not the attached client's currently-active window.
+# They diverge when a background pane (e.g. the $BROWSER hook) opens a URL while
+# the user has another window focused — without this the tab lands in the
+# focused window's group instead of the invoking window's. Empty outside tmux,
+# where the bare commands fall back to the client's current window as before.
+TMUX_PANE_TFLAG=()
+[[ -n "${TMUX_PANE:-}" ]] && TMUX_PANE_TFLAG=(-t "$TMUX_PANE")
+
 function chrome_cmd {
   local json="$1"
 
@@ -86,22 +95,22 @@ function should_use_current_mapping_for_title {
 }
 
 function tmux_get_group_title {
-  tmux show-option -qvw @chrome_group 2>/dev/null || true
+  tmux show-option -qvw "${TMUX_PANE_TFLAG[@]}" @chrome_group 2>/dev/null || true
 }
 
 function tmux_get_group_id {
-  tmux show-option -qvw @chrome_group_id 2>/dev/null || true
+  tmux show-option -qvw "${TMUX_PANE_TFLAG[@]}" @chrome_group_id 2>/dev/null || true
 }
 
 function tmux_get_group_window_id {
-  tmux show-option -qvw @chrome_window_id 2>/dev/null || true
+  tmux show-option -qvw "${TMUX_PANE_TFLAG[@]}" @chrome_window_id 2>/dev/null || true
 }
 
 function tmux_set_group_mapping {
   local title="$1"
   local group_id="$2"
   local window_id="$3"
-  local target="${4:-}"
+  local target="${4:-${TMUX_PANE:-}}"
   local -a tflag=()
   [[ -n "$target" ]] && tflag=(-t "$target")
   tmux set-option -qw "${tflag[@]}" @chrome_group "$title" 2>/dev/null || true
@@ -120,19 +129,19 @@ function tmux_clear_group_mapping_for {
 }
 
 function tmux_clear_group_mapping {
-  tmux set-option -quw @chrome_group 2>/dev/null || true
-  tmux set-option -quw @chrome_group_id 2>/dev/null || true
-  tmux set-option -quw @chrome_window_id 2>/dev/null || true
+  tmux set-option -quw "${TMUX_PANE_TFLAG[@]}" @chrome_group 2>/dev/null || true
+  tmux set-option -quw "${TMUX_PANE_TFLAG[@]}" @chrome_group_id 2>/dev/null || true
+  tmux set-option -quw "${TMUX_PANE_TFLAG[@]}" @chrome_window_id 2>/dev/null || true
   debug_log "mapping cleared"
 }
 
 function tmux_current_window_title {
-  tmux display-message -p '#W' 2>/dev/null || true
+  tmux display-message "${TMUX_PANE_TFLAG[@]}" -p '#W' 2>/dev/null || true
 }
 
 function tmux_current_window_title_normalized {
   local raw
-  raw=$(tmux display-message -p '#W' 2>/dev/null || true)
+  raw=$(tmux display-message "${TMUX_PANE_TFLAG[@]}" -p '#W' 2>/dev/null || true)
   normalize_window_title "$raw"
 }
 
@@ -395,7 +404,7 @@ function cmd_rebind_all {
 
 function cmd_switch {
   local window_name="${1:-$(tmux_current_window_title)}"
-  tmux set-option -qw @chrome_group "$window_name" 2>/dev/null
+  tmux set-option -qw "${TMUX_PANE_TFLAG[@]}" @chrome_group "$window_name" 2>/dev/null
   [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 0
 
   # switch is the periodic sync hook — tmux window name is the source of truth.
@@ -425,13 +434,13 @@ function cmd_switch {
       else
         # Mismatch: title doesn't match. Clear stored gid so we don't keep
         # propagating bad state.
-        tmux set-option -quw @chrome_group_id 2>/dev/null || true
-        tmux set-option -quw @chrome_window_id 2>/dev/null || true
+        tmux set-option -quw "${TMUX_PANE_TFLAG[@]}" @chrome_group_id 2>/dev/null || true
+        tmux set-option -quw "${TMUX_PANE_TFLAG[@]}" @chrome_window_id 2>/dev/null || true
       fi
     else
       # No matching Chrome group for this tmux window — clear any stale ids.
-      tmux set-option -quw @chrome_group_id 2>/dev/null || true
-      tmux set-option -quw @chrome_window_id 2>/dev/null || true
+      tmux set-option -quw "${TMUX_PANE_TFLAG[@]}" @chrome_group_id 2>/dev/null || true
+      tmux set-option -quw "${TMUX_PANE_TFLAG[@]}" @chrome_window_id 2>/dev/null || true
     fi
   fi
 }
@@ -443,7 +452,7 @@ function cmd_rename {
   group_id=$(tmux_get_group_id)
   window_id=$(tmux_get_group_window_id)
 
-  tmux set-option -qw @chrome_group "$new_name" 2>/dev/null
+  tmux set-option -qw "${TMUX_PANE_TFLAG[@]}" @chrome_group "$new_name" 2>/dev/null
 
   if [[ -z "$old_name" || "$(normalize_window_title "$old_name")" == "$(normalize_window_title "$new_name")" ]]; then
     return 0
@@ -526,13 +535,21 @@ function cmd_open {
     return 1
   fi
 
-  local group_name group_id window_id id response locator
+  local group_name group_id window_id id response locator active
   group_name=$(tmux_current_window_title)
   group_id=$(tmux_get_group_id)
   window_id=$(tmux_get_group_window_id)
   id=$(request_id)
+
+  # Only steal focus (activate the tab + raise Chrome) when opened from the
+  # tmux window the user is actually viewing. Opening from a non-active window
+  # — e.g. a background job that finishes and opens a results page — adds the
+  # tab quietly so it doesn't yank focus away from the current window.
+  active="true"
+  [[ "$(tmux display-message "${TMUX_PANE_TFLAG[@]}" -p '#{window_active}' 2>/dev/null)" == "1" ]] || active="false"
+
   locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
-  response=$(chrome_cmd "{\"type\":\"add_tab\",\"locator\":${locator},\"name\":$(printf '%s' "$group_name" | json_escape),\"url\":$(printf '%s' "$url" | json_escape),\"active\":true,\"id\":\"$id\"}")
+  response=$(chrome_cmd "{\"type\":\"add_tab\",\"locator\":${locator},\"name\":$(printf '%s' "$group_name" | json_escape),\"url\":$(printf '%s' "$url" | json_escape),\"active\":${active},\"id\":\"$id\"}")
 
   local success
   success=$(echo "$response" | jq -r '.success // false')
@@ -546,8 +563,12 @@ function cmd_open {
       resolved_title="$group_name"
     fi
     tmux_set_group_mapping "${resolved_title:-$group_name}" "$resolved_group_id" "$resolved_window_id"
-    echo "Opened in '${resolved_title:-$group_name}': $url"
-    cmd_focus chrome >/dev/null 2>&1 || true
+    if [[ "$active" == "true" ]]; then
+      echo "Opened in '${resolved_title:-$group_name}': $url"
+      cmd_focus chrome >/dev/null 2>&1 || true
+    else
+      echo "Opened (background) in '${resolved_title:-$group_name}': $url"
+    fi
   else
     echo "Error: $(echo "$response" | jq -r '.error // "unknown"')" >&2
     return 1
