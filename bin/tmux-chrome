@@ -9,6 +9,7 @@ CHROME_BRIDGE_SOCKET="/tmp/tmux-chrome-bridge.sock"
 # Where snapshots of the tab-group layout are written. Used both by the manual
 # `snapshot` command and automatically before any destructive `sync`.
 TMUX_CHROME_STATE_DIR="${TMUX_CHROME_STATE_DIR:-$HOME/.local/state/tmux-chrome}"
+TMUX_CHROME_LAYOUTS_FILE="${TMUX_CHROME_LAYOUTS_FILE:-$HOME/.config/tmux-chrome/window-layouts.json}"
 
 # sync will refuse to ungroup more than this many groups at once unless given
 # --force-all. This is the guardrail against the "everything got scattered"
@@ -1158,13 +1159,17 @@ function cmd_rebind_current_window {
 }
 
 function cmd_picker {
-  # Unified fzf picker: apps + current window's tab group tabs
+  # Unified fzf picker: apps + saved layouts + window actions + current window's tabs
   local apps="app\t[app] Chrome\napp\t[app] Slack\napp\t[app] Zoom\napp\t[app] Discord"
+  local actions="action:swap-window\t[action] Swap terminal ↔ Chrome window position\naction:distribute\t[action] Distribute terminal & Chrome to separate displays"
+  local layouts_section=""
   local tabs_section=""
   local group_name group_id window_id
   group_name=$(tmux_current_window_title 2>/dev/null)
   group_id=$(tmux_get_group_id)
   window_id=$(tmux_get_group_window_id)
+
+  layouts_section=$(cmd_window_layout_list 2>/dev/null | awk -F '\t' '{ printf "layout:%s\t[layout] %s  (%s: %s)\n", $2, $3, $4, $5 }')
 
   if [[ -S "$CHROME_BRIDGE_SOCKET" ]] && [[ -n "$group_name" ]]; then
     local id response locator
@@ -1180,6 +1185,10 @@ function cmd_picker {
 
   local fzf_input
   fzf_input=$(printf "%b" "$apps")
+  if [[ -n "$layouts_section" ]]; then
+    fzf_input="$fzf_input"$'\n'"$layouts_section"
+  fi
+  fzf_input="$fzf_input"$'\n'"$(printf "%b" "$actions")"
   if [[ -n "$tabs_section" ]]; then
     fzf_input="$fzf_input"$'\n'"$tabs_section"
   fi
@@ -1202,6 +1211,15 @@ function cmd_picker {
       local app_name
       app_name=$(echo "$selected" | cut -f2 | sed 's/^\[app\] //')
       cmd_focus "$app_name"
+      ;;
+    action:swap-window)
+      cmd_swap_window
+      ;;
+    action:distribute)
+      cmd_distribute_windows
+      ;;
+    layout:*)
+      cmd_window_layout_apply "${type_field#layout:}"
       ;;
     tab:*)
       local tab_id="${type_field#tab:}"
@@ -1299,59 +1317,586 @@ function cmd_cycle_tab {
   fi
 }
 
+function layout_default_json {
+  cat <<'JSON'
+{
+  "layouts": [
+    {
+      "id": "chrome-terminal",
+      "title": "Chrome + Terminal",
+      "left": "chrome",
+      "right": "terminal"
+    },
+    {
+      "id": "slack-terminal",
+      "title": "Slack + Terminal",
+      "left": "slack",
+      "right": "terminal"
+    },
+    {
+      "id": "slack-chrome",
+      "title": "Slack + Chrome",
+      "left": "slack",
+      "right": "chrome"
+    },
+    {
+      "id": "single-chrome-terminal",
+      "title": "Single Display: Chrome + Terminal",
+      "mode": "split",
+      "left": "chrome",
+      "right": "terminal"
+    },
+    {
+      "id": "three-display",
+      "title": "3 Displays: Slack | Chrome | Terminal",
+      "placements": [
+        { "app": "slack", "display": "left" },
+        { "app": "chrome", "display": "center" },
+        { "app": "terminal", "display": "right" }
+      ]
+    }
+  ]
+}
+JSON
+}
+
+function layout_ensure_config {
+  if [[ -f "$TMUX_CHROME_LAYOUTS_FILE" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$TMUX_CHROME_LAYOUTS_FILE")"
+  layout_default_json > "$TMUX_CHROME_LAYOUTS_FILE"
+  echo "Created $TMUX_CHROME_LAYOUTS_FILE" >&2
+}
+
+function layout_resolve_app {
+  local app="$1"
+  local lower
+  lower=$(printf '%s' "$app" | tr '[:upper:]' '[:lower:]')
+  case "$lower" in
+    chrome|google-chrome|google\ chrome)
+      printf '%s\n' "Google Chrome"
+      ;;
+    slack)
+      printf '%s\n' "Slack"
+      ;;
+    terminal|tmux)
+      detect_tmux_terminal_app
+      ;;
+    ghostty)
+      printf '%s\n' "Ghostty"
+      ;;
+    iterm|iterm2)
+      printf '%s\n' "iTerm2"
+      ;;
+    alacritty)
+      printf '%s\n' "Alacritty"
+      ;;
+    kitty)
+      printf '%s\n' "kitty"
+      ;;
+    wezterm)
+      printf '%s\n' "WezTerm"
+      ;;
+    warp)
+      printf '%s\n' "Warp"
+      ;;
+    *)
+      printf '%s\n' "$app"
+      ;;
+  esac
+}
+
+function layout_select_json {
+  local selector="${1:-}"
+  layout_ensure_config
+
+  if [[ -z "$selector" ]]; then
+    jq -c '.layouts[0] // empty' "$TMUX_CHROME_LAYOUTS_FILE"
+    return 0
+  fi
+
+  if [[ "$selector" =~ ^[0-9]+$ ]]; then
+    jq -c --argjson idx "$selector" '.layouts[$idx] // empty' "$TMUX_CHROME_LAYOUTS_FILE"
+  else
+    jq -c --arg selector "$selector" '
+      .layouts[]?
+      | select(
+          (.id // "") == $selector
+          or (.title // "") == $selector
+          or ((.name // "") == $selector)
+        )
+    ' "$TMUX_CHROME_LAYOUTS_FILE" | head -1
+  fi
+}
+
+function cmd_window_layout_init {
+  if [[ -f "$TMUX_CHROME_LAYOUTS_FILE" ]]; then
+    echo "$TMUX_CHROME_LAYOUTS_FILE"
+    return 0
+  fi
+  layout_ensure_config >/dev/null
+  echo "$TMUX_CHROME_LAYOUTS_FILE"
+}
+
+function cmd_window_layout_list {
+  layout_ensure_config >/dev/null
+  jq -r '
+    def app_summary:
+      if (.placements // null) != null then
+        ([.placements[] | "\(.app)@\(.display // "current")"] | join(", "))
+      else
+        ((.left // "?") + " | " + (.right // "?"))
+      end;
+    def layout_mode:
+      if (.placements // null) != null then "placements" else (.mode // "display") end;
+    .layouts
+    | to_entries[]
+    | [(.key|tostring), (.value.id // ""), (.value.title // .value.name // .value.id // "untitled"), (.value | layout_mode), (.value | app_summary)]
+    | @tsv
+  ' "$TMUX_CHROME_LAYOUTS_FILE"
+}
+
+function cmd_window_layout_edit {
+  layout_ensure_config >/dev/null
+  "${EDITOR:-open}" "$TMUX_CHROME_LAYOUTS_FILE"
+}
+
+function cmd_window_layout_path {
+  echo "$TMUX_CHROME_LAYOUTS_FILE"
+}
+
+function cmd_window_layout_apply {
+  local selector="${1:-}"
+  local layout
+  layout=$(layout_select_json "$selector")
+  if [[ -z "$layout" ]]; then
+    echo "Error: layout not found: ${selector:-0}" >&2
+    echo "Available layouts:" >&2
+    cmd_window_layout_list >&2 || true
+    return 1
+  fi
+
+  local title gap mode placements_json
+  title=$(echo "$layout" | jq -r '.title // .name // .id // "layout"')
+  gap=$(echo "$layout" | jq -r '.gap // 0')
+  mode=$(echo "$layout" | jq -r '.mode // "display"')
+  if ! [[ "$gap" =~ ^[0-9]+$ ]]; then
+    gap=0
+  fi
+
+  # Build a normalized placements list: [{app, display, region?}]. Two input
+  # shapes are supported:
+  #   1. explicit `placements: [{app, display, region?}, ...]` — full control,
+  #      one entry per window; `display` selects which physical screen.
+  #   2. legacy `left`/`right` + `mode` shorthand:
+  #        mode=display → left app on the leftmost screen, right app on the
+  #          rightmost screen (each fills its screen).
+  #        mode=split   → both on the CURRENT screen, left/right halves.
+  # App names are resolved here (bash) because terminal detection needs tmux;
+  # the JXA side only deals with already-resolved macOS app names.
+  local raw_placements
+  raw_placements=$(echo "$layout" | jq -c '.placements // empty')
+
+  if [[ -n "$raw_placements" && "$raw_placements" != "null" ]]; then
+    placements_json="[]"
+    local count i
+    count=$(echo "$raw_placements" | jq 'length')
+    for ((i = 0; i < count; i++)); do
+      local entry app disp region rapp
+      entry=$(echo "$raw_placements" | jq -c ".[$i]")
+      app=$(echo "$entry" | jq -r '.app // empty')
+      disp=$(echo "$entry" | jq -r '.display // "current"')
+      region=$(echo "$entry" | jq -r '.region // empty')
+      if [[ -z "$app" ]]; then
+        echo "Error: layout '$title' placement #$i is missing 'app'" >&2
+        return 1
+      fi
+      rapp=$(layout_resolve_app "$app") || return 1
+      placements_json=$(echo "$placements_json" | jq -c \
+        --arg app "$rapp" --arg disp "$disp" --arg region "$region" \
+        '. + [ {app: $app, display: $disp}
+               + (if $region == "" then {} else {region: $region} end) ]')
+    done
+  else
+    local left_spec right_spec left_app right_app
+    left_spec=$(echo "$layout" | jq -r '.left // empty')
+    right_spec=$(echo "$layout" | jq -r '.right // empty')
+    if [[ -z "$left_spec" || -z "$right_spec" ]]; then
+      echo "Error: layout '$title' must define either 'placements' or both 'left' and 'right'" >&2
+      return 1
+    fi
+    left_app=$(layout_resolve_app "$left_spec") || return 1
+    right_app=$(layout_resolve_app "$right_spec") || return 1
+
+    if [[ "$mode" == "split" ]]; then
+      placements_json=$(jq -nc --arg l "$left_app" --arg r "$right_app" \
+        '[{app:$l, display:"current", region:"left-half"},
+          {app:$r, display:"current", region:"right-half"}]')
+    else
+      placements_json=$(jq -nc --arg l "$left_app" --arg r "$right_app" \
+        '[{app:$l, display:"leftmost", region:"full"},
+          {app:$r, display:"rightmost", region:"full"}]')
+    fi
+  fi
+
+  if [[ "$(echo "$placements_json" | jq 'length')" -eq 0 ]]; then
+    echo "Error: layout '$title' has no windows to place" >&2
+    return 1
+  fi
+
+  local result
+  result=$(osascript -l JavaScript - "$gap" "$placements_json" <<'JXA' 2>&1
+ObjC.import('AppKit');
+function run(argv) {
+  const gap = Math.max(0, Number(argv[0] || 0));
+  let placements;
+  try {
+    placements = JSON.parse(argv[1] || '[]');
+  } catch (e) {
+    throw new Error('invalid placements json: ' + e);
+  }
+  if (!placements.length) throw new Error('no placements');
+
+  const se = Application('System Events');
+  const screens = $.NSScreen.screens;
+  if (screens.count < 1) throw new Error('No screens found');
+
+  // NSScreen uses a bottom-left origin; System Events / Chrome bounds use a
+  // top-left origin. Convert every frame through the primary screen height.
+  // screens[0] is the primary (menu-bar) screen.
+  const H = screens.objectAtIndex(0).frame.size.height;
+  const all = [];
+  for (let i = 0; i < screens.count; i++) {
+    const f = screens.objectAtIndex(i).frame;
+    const vf = screens.objectAtIndex(i).visibleFrame;
+    all.push({
+      nsIndex: i,
+      isPrimary: i === 0,
+      x: Math.round(f.origin.x),
+      y: Math.round(H - (f.origin.y + f.size.height)),
+      w: Math.round(f.size.width),
+      h: Math.round(f.size.height),
+      vx: Math.round(vf.origin.x),
+      vy: Math.round(H - (vf.origin.y + vf.size.height)),
+      vw: Math.round(vf.size.width),
+      vh: Math.round(vf.size.height),
+    });
+  }
+
+  // Physical left-to-right (then top-to-bottom) ordering. This is what "left"
+  // / "right" / "center" / numeric indices resolve against, so a 3-display
+  // setup exposes screen 0,1,2 from leftmost to rightmost regardless of the
+  // OS enumeration order.
+  const sorted = all.slice().sort((a, b) => (a.x - b.x) || (a.y - b.y));
+  const primary = all.find((d) => d.isPrimary) || sorted[0];
+
+  function displayOf(cx, cy) {
+    for (const d of all) {
+      if (cx >= d.x && cx < d.x + d.w && cy >= d.y && cy < d.y + d.h) return d;
+    }
+    return primary;
+  }
+
+  function frontProcessDisplay() {
+    try {
+      const proc = se.applicationProcesses.whose({ frontmost: true })[0];
+      if (!proc || proc.windows.length === 0) return primary;
+      const p = proc.windows[0].position();
+      const s = proc.windows[0].size();
+      return displayOf(p[0] + s[0] / 2, p[1] + s[1] / 2);
+    } catch (_) {
+      return primary;
+    }
+  }
+
+  function resolveDisplay(sel) {
+    let s = (sel === undefined || sel === null) ? 'current' : String(sel).trim().toLowerCase();
+    if (s === '') s = 'current';
+    if (/^-?\d+$/.test(s)) {
+      let idx = parseInt(s, 10);
+      if (idx < 0) idx = sorted.length + idx; // -1 → rightmost
+      if (idx < 0) idx = 0;
+      if (idx >= sorted.length) idx = sorted.length - 1;
+      return sorted[idx];
+    }
+    switch (s) {
+      case 'left': case 'leftmost': return sorted[0];
+      case 'right': case 'rightmost': return sorted[sorted.length - 1];
+      case 'center': case 'middle': return sorted[Math.floor((sorted.length - 1) / 2)];
+      case 'primary': case 'main': return primary;
+      case 'current': case 'active': case 'focused': return frontProcessDisplay();
+      default: return frontProcessDisplay();
+    }
+  }
+
+  function regionFrame(d, region) {
+    const r = (region || 'full').toLowerCase();
+    if (r === 'left-half') {
+      const half = Math.floor((d.vw - gap) / 2);
+      return { x: d.vx, y: d.vy, w: half, h: d.vh };
+    }
+    if (r === 'right-half') {
+      const half = Math.floor((d.vw - gap) / 2);
+      return { x: d.vx + half + gap, y: d.vy, w: d.vw - half - gap, h: d.vh };
+    }
+    if (r === 'top-half') {
+      const half = Math.floor((d.vh - gap) / 2);
+      return { x: d.vx, y: d.vy, w: d.vw, h: half };
+    }
+    if (r === 'bottom-half') {
+      const half = Math.floor((d.vh - gap) / 2);
+      return { x: d.vx, y: d.vy + half + gap, w: d.vw, h: d.vh - half - gap };
+    }
+    return { x: d.vx, y: d.vy, w: d.vw, h: d.vh };
+  }
+
+  // Resolve every placement to a display, then place each window. Multiple
+  // windows on the SAME display each fill that display (they overlap) unless a
+  // window asks for an explicit region — we do NOT auto-split a screen into
+  // arbitrary columns, since overlapping full-size windows are easier to use
+  // than guessed splits.
+  const entries = placements.map((p, i) => ({
+    i, app: p.app, region: p.region || '', d: resolveDisplay(p.display),
+  }));
+
+  const frames = [];
+  entries.forEach((e) => {
+    frames[e.i] = regionFrame(e.d, e.region || 'full');
+  });
+
+  function setAppWindow(appName, frame) {
+    const app = Application(appName);
+    app.activate();
+    delay(0.05);
+    if (appName === 'Google Chrome') {
+      if (app.windows.length === 0) throw new Error('No window found for ' + appName);
+      app.windows[0].bounds = { x: frame.x, y: frame.y, width: frame.w, height: frame.h };
+    } else {
+      const proc = se.processes.byName(appName);
+      if (proc.windows.length === 0) throw new Error('No window found for ' + appName);
+      const win = proc.windows[0];
+      win.position = [frame.x, frame.y];
+      win.size = [frame.w, frame.h];
+      try { win.actions.byName('AXRaise').perform(); } catch (_) {}
+    }
+  }
+
+  const summary = [];
+  entries.forEach((e) => {
+    setAppWindow(e.app, frames[e.i]);
+    summary.push(e.app + '@display' + e.d.nsIndex);
+  });
+
+  // Leave focus on the last placement (commonly the terminal).
+  try { Application(entries[entries.length - 1].app).activate(); } catch (_) {}
+
+  return 'screens=' + sorted.length + ' ' + summary.join(' ');
+}
+JXA
+)
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "Error: window layout failed: $result" >&2
+    return 1
+  fi
+
+  # If a terminal is one of the windows, nudge tmux to pick up the new size.
+  tmux refresh-client -S >/dev/null 2>&1 || true
+  echo "Applied layout '$title': $result"
+}
+
+function cmd_window_layout {
+  local action="${1:-list}"
+  shift 2>/dev/null || true
+  case "$action" in
+    init)  cmd_window_layout_init "$@" ;;
+    list)  cmd_window_layout_list "$@" ;;
+    apply) cmd_window_layout_apply "$@" ;;
+    edit)  cmd_window_layout_edit "$@" ;;
+    path)  cmd_window_layout_path "$@" ;;
+    *)
+      # Convenience: `tmux-chrome window-layout chrome-terminal` applies it.
+      cmd_window_layout_apply "$action" "$@"
+      ;;
+  esac
+}
+# cmd_distribute_windows — if the tmux terminal window and Chrome's front
+# window share the same physical display, move Chrome to fill another display
+# (one that doesn't hold the terminal). No-op when they're already on separate
+# displays or when only one display is connected.
+#
+# Implemented as a single JXA (osascript -l JavaScript) call so it can reach
+# AppKit's NSScreen for exact per-display logical frames — AppleScript can't
+# enumerate displays, and shelling a Swift helper costs ~500ms. NSScreen uses a
+# bottom-left origin; System Events / Chrome bounds use top-left, so frames are
+# converted via the primary screen height.
+function cmd_distribute_windows {
+  local terminal_app
+  terminal_app=$(detect_tmux_terminal_app) || return 1
+
+  local result
+  result=$(osascript -l JavaScript - "$terminal_app" <<'JXA' 2>&1
+ObjC.import('AppKit');
+function run(argv) {
+  const termApp = argv[0] || 'Ghostty';
+  const screens = $.NSScreen.screens;
+  const n = screens.count;
+  if (n < 2) return 'single-display';
+
+  const H = screens.objectAtIndex(0).frame.size.height;
+  const displays = [];
+  for (let i = 0; i < n; i++) {
+    const f = screens.objectAtIndex(i).frame;
+    const vf = screens.objectAtIndex(i).visibleFrame;
+    displays.push({
+      i,
+      x: Math.round(f.origin.x),
+      y: Math.round(H - (f.origin.y + f.size.height)),
+      w: Math.round(f.size.width),
+      h: Math.round(f.size.height),
+      vx: Math.round(vf.origin.x),
+      vy: Math.round(H - (vf.origin.y + vf.size.height)),
+      vw: Math.round(vf.size.width),
+      vh: Math.round(vf.size.height),
+    });
+  }
+
+  function displayOf(cx, cy) {
+    for (const d of displays) {
+      if (cx >= d.x && cx < d.x + d.w && cy >= d.y && cy < d.y + d.h) return d;
+    }
+    return displays[0];
+  }
+
+  const se = Application('System Events');
+  const termProc = se.processes.byName(termApp);
+  if (termProc.windows.length === 0) return 'no-terminal-window';
+  const tw = termProc.windows[0];
+  const tpos = tw.position();
+  const tsize = tw.size();
+  const termDisp = displayOf(tpos[0] + tsize[0] / 2, tpos[1] + tsize[1] / 2);
+
+  const chrome = Application('Google Chrome');
+  if (chrome.windows.length === 0) return 'no-chrome-window';
+  const b = chrome.windows[0].bounds();
+  const chromeDisp = displayOf(b.x + b.width / 2, b.y + b.height / 2);
+
+  if (termDisp.i !== chromeDisp.i) {
+    return 'ok-separate';
+  }
+
+  const target = displays.find((d) => d.i !== termDisp.i);
+  if (!target) return 'no-target';
+
+  chrome.windows[0].bounds = { x: target.vx, y: target.vy, width: target.vw, height: target.vh };
+  return 'moved display' + chromeDisp.i + ' -> display' + target.i;
+}
+JXA
+)
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "Error: distribute failed: $result" >&2
+    return 1
+  fi
+
+  case "$result" in
+    moved*)        echo "Distributed: $result" ;;
+    ok-separate)   echo "Already on separate displays — nothing to do." ;;
+    single-display) echo "Only one display — nothing to distribute." ;;
+    no-chrome-window) echo "No Chrome window to move." >&2; return 1 ;;
+    *)             echo "Distribute: $result" ;;
+  esac
+}
+
 function cmd_swap_window {
   local terminal_app
   terminal_app=$(detect_tmux_terminal_app) || return 1
 
-  local previous_app
-  previous_app=$(current_frontmost_app)
-
-  local terminal_geometry
-  terminal_geometry=$(ax_window_geometry "$terminal_app" get) || {
-    echo "Error: failed to read geometry for $terminal_app" >&2
-    return 1
-  }
-
-  local terminal_x terminal_y terminal_width terminal_height
-  IFS=$'\t' read -r terminal_x terminal_y terminal_width terminal_height <<< "$terminal_geometry"
-
-  local chrome_bounds
-  chrome_bounds=$(osascript <<'APPLESCRIPT'
-tell application "Google Chrome"
-  if (count of windows) is 0 then
-    error "No window found for Google Chrome"
-  end if
-  set b to bounds of front window
-  return (item 1 of b as text) & "|" & (item 2 of b as text) & "|" & ((item 3 of b) - (item 1 of b) as text) & "|" & ((item 4 of b) - (item 2 of b) as text)
+  # Swap the terminal window and Chrome's front window geometry in a SINGLE
+  # osascript round-trip. Each external process spawn is the dominant latency
+  # here — the previous implementation shelled out to a Swift `ax-window-geometry`
+  # helper twice (~500ms each = ~1s) plus separate AppleScript calls. Doing it
+  # all in one System Events + Chrome script collapses that to one ~150ms call.
+  #
+  # Terminal geometry is read/written via System Events (Accessibility); Chrome
+  # via its native AppleScript dictionary (bounds = {left,top,right,bottom}).
+  local result
+  result=$(osascript <<APPLESCRIPT 2>&1
+tell application "System Events" to tell process "$terminal_app"
+  set tp to position of front window
+  set ts to size of front window
 end tell
+set termX to item 1 of tp
+set termY to item 2 of tp
+set termW to item 1 of ts
+set termH to item 2 of ts
+
+tell application "Google Chrome"
+  if (count of windows) is 0 then error "No window found for Google Chrome"
+  set b to bounds of front window
+  set chrX to item 1 of b
+  set chrY to item 2 of b
+  set chrW to (item 3 of b) - (item 1 of b)
+  set chrH to (item 4 of b) - (item 2 of b)
+  -- Chrome takes the terminal's old slot.
+  set bounds of front window to {termX, termY, termX + termW, termY + termH}
+end tell
+
+-- Terminal takes Chrome's old slot.
+tell application "System Events" to tell process "$terminal_app"
+  set position of front window to {chrX, chrY}
+  set size of front window to {chrW, chrH}
+end tell
+
+-- Report both windows' NEW sizes: terminal is now chrW x chrH, Chrome is now
+-- termW x termH. Caller uses these to refresh tmux and focus the larger window.
+return (chrW as text) & "x" & (chrH as text) & " " & (termW as text) & "x" & (termH as text)
 APPLESCRIPT
-) || {
-    echo "Error: failed to read geometry for Google Chrome" >&2
+)
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "Error: window swap failed: $result" >&2
     return 1
-  }
+  fi
 
-  local chrome_x chrome_y chrome_width chrome_height
-  IFS='|' read -r chrome_x chrome_y chrome_width chrome_height <<< "$chrome_bounds"
-
-  ax_window_geometry "$terminal_app" set "$chrome_x" "$chrome_y" "$chrome_width" "$chrome_height" >/dev/null || {
-    echo "Error: failed to move $terminal_app window" >&2
-    return 1
-  }
-
-  osascript <<APPLESCRIPT >/dev/null
- tell application "Google Chrome"
-   set bounds of front window to {$terminal_x, $terminal_y, $((terminal_x + terminal_width)), $((terminal_y + terminal_height))}
- end tell
-APPLESCRIPT
+  # result is "<term_w>x<term_h> <chrome_w>x<chrome_h>" — each window's NEW size.
+  local term_size chrome_size
+  term_size="${result%% *}"
+  chrome_size="${result##* }"
+  local chrome_width="${term_size%x*}"
+  local chrome_height="${term_size#*x}"
 
   tmux refresh-client -S >/dev/null 2>&1 || true
-  tmux refresh-client -C "${chrome_width}x${chrome_height}" >/dev/null 2>&1 || true
+  if [[ "$chrome_width" =~ ^[0-9]+$ && "$chrome_height" =~ ^[0-9]+$ ]]; then
+    tmux refresh-client -C "${chrome_width}x${chrome_height}" >/dev/null 2>&1 || true
+  fi
 
-  if [[ -n "$previous_app" ]]; then
-    cmd_focus "$previous_app" >/dev/null 2>&1 || true
+  # Bring BOTH windows to the front (in case either was buried behind another
+  # app), then leave focus on the larger one. Order matters: activate the
+  # smaller window first, then the larger — the last `activate` wins focus, and
+  # both end up above any unrelated apps. Two osascript calls run in the
+  # background so they don't add latency to the swap result.
+  local term_w="${term_size%x*}" term_h="${term_size#*x}"
+  local chr_w="${chrome_size%x*}" chr_h="${chrome_size#*x}"
+  local activate_chrome='tell application "Google Chrome" to activate'
+  local activate_term="tell application \"$terminal_app\" to activate"
+  if [[ "$term_w" =~ ^[0-9]+$ && "$term_h" =~ ^[0-9]+$ && "$chr_w" =~ ^[0-9]+$ && "$chr_h" =~ ^[0-9]+$ ]] \
+     && (( term_w * term_h >= chr_w * chr_h )); then
+    # Terminal is larger → Chrome first, terminal last (terminal gets focus).
+    osascript -e "$activate_chrome" -e "$activate_term" >/dev/null 2>&1 || true
+  else
+    # Chrome is larger → terminal first, Chrome last (Chrome gets focus).
+    osascript -e "$activate_term" -e "$activate_chrome" >/dev/null 2>&1 || true
   fi
 
   echo "Swapped window geometry: $terminal_app ↔ Google Chrome"
+
+  # If the swap left the terminal and Chrome overlapping on one display, push
+  # Chrome onto a free display. No-op when they're already on separate screens
+  # or only one display is connected.
+  cmd_distribute_windows >/dev/null 2>&1 || true
 }
 
 
@@ -1385,8 +1930,10 @@ function main {
     rebind-all) cmd_rebind_all "$@" ;;
     picker)  cmd_picker ;;
     swap-window) cmd_swap_window ;;
+    window-layout) cmd_window_layout "$@" ;;
+    distribute|distribute-windows) cmd_distribute_windows ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|snapshot|restore|merge|cycle-tab|rebind-current-window|rebind-all|picker|swap-window}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|snapshot|restore|merge|cycle-tab|rebind-current-window|rebind-all|picker|swap-window|window-layout|distribute}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -1412,6 +1959,8 @@ function main {
       echo "  rebind-current-window  Rebind this tmux window to the active Chrome group"
       echo "  rebind-all [--dry-run] Rebind every tmux window's @chrome_group* options to matching Chrome groups by title"
       echo "  swap-window     Swap current tmux terminal window geometry with active Chrome window"
+      echo "  window-layout [list|apply <id>|edit|init|path]  Manage/apply saved left/right app layouts"
+      echo "  distribute      If terminal and Chrome overlap on one display, move Chrome to a free display"
       return 1
       ;;
   esac

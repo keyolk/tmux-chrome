@@ -45,7 +45,7 @@ make install
 make raycast-dev
 ```
 
-Registers two Raycast commands: **Switch Tab Group** and **Browse Tabs**.
+Registers Raycast commands for tab groups, tab browsing, tmux window switching, window swapping/distribution, and saved workspace layouts.
 
 ## Usage
 
@@ -80,7 +80,14 @@ tmux-chrome restore <file>       # Rebuild from a specific snapshot
 tmux-chrome grab                 # Extract URLs from tmux panes → fzf multi-select → add to group
 tmux-chrome tabs                 # Browse current group's tabs via fzf → focus selected
 tmux-chrome tabs --all           # Browse all tabs across all groups
-tmux-chrome picker               # Unified picker for apps + current group's tabs
+tmux-chrome picker               # Unified picker for apps + layouts + current group's tabs
+
+# Window workspace layouts
+# Default config: ~/.config/tmux-chrome/window-layouts.json
+# left/right mean physical left/right displays; use mode: "split" for one-display halves.
+tmux-chrome window-layout list
+tmux-chrome window-layout apply chrome-terminal
+tmux-chrome window-layout edit
 ```
 
 ### From tmux.sh
