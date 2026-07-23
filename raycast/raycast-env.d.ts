@@ -19,6 +19,14 @@ declare namespace Preferences {
   export type SwitchTab = ExtensionPreferences & {}
   /** Preferences accessible in the `switch-tmux-window` command */
   export type SwitchTmuxWindow = ExtensionPreferences & {}
+  /** Preferences accessible in the `swap-window` command */
+  export type SwapWindow = ExtensionPreferences & {}
+  /** Preferences accessible in the `distribute-windows` command */
+  export type DistributeWindows = ExtensionPreferences & {}
+  /** Preferences accessible in the `window-layout` command */
+  export type WindowLayout = ExtensionPreferences & {}
+  /** Preferences accessible in the `clean-tabs` command */
+  export type CleanTabs = ExtensionPreferences & {}
 }
 
 declare namespace Arguments {
@@ -28,5 +36,13 @@ declare namespace Arguments {
   export type SwitchTab = {}
   /** Arguments passed to the `switch-tmux-window` command */
   export type SwitchTmuxWindow = {}
+  /** Arguments passed to the `swap-window` command */
+  export type SwapWindow = {}
+  /** Arguments passed to the `distribute-windows` command */
+  export type DistributeWindows = {}
+  /** Arguments passed to the `window-layout` command */
+  export type WindowLayout = {}
+  /** Arguments passed to the `clean-tabs` command */
+  export type CleanTabs = {}
 }
 

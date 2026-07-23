@@ -112,3 +112,9 @@ export async function raiseTabWindow(tabId: number): Promise<void> {
 export async function deleteGroup(name: string): Promise<void> {
   await bridgeRequest({ type: "delete_group", name });
 }
+
+export async function cleanTabs(): Promise<{ moved?: number; group?: string }> {
+  return bridgeRequest<{ moved?: number; group?: string }>({
+    type: "clean_tabs",
+  });
+}
