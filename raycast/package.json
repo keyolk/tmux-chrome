@@ -1,11 +1,13 @@
 {
   "$schema": "https://www.raycast.com/schemas/extension.json",
   "name": "tmux-chrome-bridge",
-  "title": "tmux Chrome Tab Groups",
+  "title": "Tmux Chrome Tab Groups",
   "description": "Switch Chrome tab groups synced with tmux windows",
   "icon": "command-icon.png",
   "author": "keyolk",
-  "categories": ["Productivity"],
+  "categories": [
+    "Productivity"
+  ],
   "license": "MIT",
   "commands": [
     {
@@ -25,6 +27,30 @@
       "title": "Switch Tmux Window",
       "description": "List and switch tmux windows across all sessions",
       "mode": "view"
+    },
+    {
+      "name": "swap-window",
+      "title": "Swap Terminal and Chrome Window",
+      "description": "Swap the position/size of the tmux terminal window and the front Chrome window",
+      "mode": "no-view"
+    },
+    {
+      "name": "distribute-windows",
+      "title": "Distribute Terminal and Chrome Windows",
+      "description": "If the terminal and Chrome overlap on one display, move Chrome to a free display",
+      "mode": "no-view"
+    },
+    {
+      "name": "window-layout",
+      "title": "Apply Window Layout",
+      "description": "Apply a saved left/right app workspace layout",
+      "mode": "view"
+    },
+    {
+      "name": "clean-tabs",
+      "title": "Clean Ungrouped Tabs",
+      "description": "Close all Chrome tabs not belonging to any tab group",
+      "mode": "no-view"
     }
   ],
   "dependencies": {

@@ -45,7 +45,7 @@ make install
 make raycast-dev
 ```
 
-Registers two Raycast commands: **Switch Tab Group** and **Browse Tabs**.
+Registers Raycast commands for tab groups, tab browsing, tmux window switching, window swapping/distribution, saved workspace layouts, and sweeping ungrouped tabs.
 
 ## Usage
 
@@ -68,7 +68,7 @@ tmux-chrome import-group --force <name>  # …overwrite an existing matching Chr
 tmux-chrome add <url>            # Add URL to current window's group (auto-creates group)
 tmux-chrome move                 # Move Chrome's active tab into current window's group
 tmux-chrome remove               # Remove Chrome's active tab from its group
-tmux-chrome clean                # Close all tabs that aren't in any tab group
+tmux-chrome clean                # Move all tabs not in any tab group into a reserved native group
 tmux-chrome sync                 # REPORT tab groups with no matching tmux window (read-only)
 tmux-chrome sync --quiet         # …same, but suppress no-op output (for tmux hooks)
 tmux-chrome sync --force         # …and ungroup them (snapshots first; caps bulk wipes)
@@ -80,7 +80,14 @@ tmux-chrome restore <file>       # Rebuild from a specific snapshot
 tmux-chrome grab                 # Extract URLs from tmux panes → fzf multi-select → add to group
 tmux-chrome tabs                 # Browse current group's tabs via fzf → focus selected
 tmux-chrome tabs --all           # Browse all tabs across all groups
-tmux-chrome picker               # Unified picker for apps + current group's tabs
+tmux-chrome picker               # Unified picker for apps + layouts + current group's tabs
+
+# Window workspace layouts
+# Default config: ~/.config/tmux-chrome/window-layouts.json
+# left/right mean physical left/right displays; use mode: "split" for one-display halves.
+tmux-chrome window-layout list
+tmux-chrome window-layout apply chrome-terminal
+tmux-chrome window-layout edit
 ```
 
 ### From tmux.sh
