@@ -5,8 +5,11 @@
 url="$1"
 [[ -z "$url" ]] && exit 1
 
-# If inside tmux and bridge socket exists, use grouped open
-if [[ -n "$TMUX" ]] && [[ -S /tmp/tmux-chrome-bridge.sock ]]; then
+# If inside tmux, hand it to tmux-chrome. The bridge socket is required for the
+# Chrome path but not for the TWeb one, which talks to a pane rather than to the
+# extension — gating both on the socket sent every URL to the system browser
+# whenever Chrome's bridge happened to be down.
+if [[ -n "$TMUX" ]] && { [[ -S /tmp/tmux-chrome-bridge.sock ]] || [[ -n "$TMUX_CHROME_TWEB" ]]; }; then
   exec tmux-chrome open "$url"
 fi
 

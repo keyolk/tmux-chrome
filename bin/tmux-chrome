@@ -529,12 +529,59 @@ function cmd_focus {
   esac
 }
 
+# Whether TWeb should take this URL instead of Chrome, and how.
+#
+# Prints the pane id of a TWeb pane already running in THIS tmux window, or the
+# empty string when there is none. The caller decides between a new tab in that
+# pane and a fresh split; both are TWeb, and the difference is only whether a
+# pane has to be created.
+#
+# Window id rather than session plus name: it is unique per tmux server, so one
+# comparison settles it, and it survives a window being renamed underneath us.
+function tweb_pane_in_current_window {
+  local pane current
+  current=$(tmux display-message "${TMUX_PANE_TFLAG[@]}" -p '#{window_id}' 2>/dev/null)
+  [[ -z "$current" ]] && return 0
+
+  while read -r pane; do
+    [[ -z "$pane" ]] && continue
+    # A pane TWeb still lists can be gone from tmux — the engine outlives its pane
+    # briefly on exit — so this doubles as the liveness check.
+    [[ "$(tmux display-message -t "$pane" -p '#{window_id}' 2>/dev/null)" == "$current" ]] || continue
+    printf '%s\n' "$pane"
+    return 0
+  done < <(tweb panes --json 2>/dev/null | jq -r '.[].pane // empty' 2>/dev/null)
+}
+
+# Hands the URL to TWeb when TMUX_CHROME_TWEB is set. Returns non-zero when it
+# did not, so the caller falls through to Chrome — a URL must never be lost to a
+# TWeb that is missing, broken, or not installed.
+function try_tweb_open {
+  local url="$1" pane
+  [[ -z "$TMUX_CHROME_TWEB" || "$TMUX_CHROME_TWEB" == "0" ]] && return 1
+  command -v tweb >/dev/null 2>&1 || return 1
+
+  pane=$(tweb_pane_in_current_window)
+  if [[ -n "$pane" ]]; then
+    tweb tab new --pane "$pane" "$url" >/dev/null 2>&1 || return 1
+    echo "Opened in TWeb pane $pane: $url"
+    return 0
+  fi
+
+  # No pane here yet, so make one. The split lands in the caller's window, which
+  # is the same window this just looked in.
+  tweb split "$url" >/dev/null 2>&1 || return 1
+  echo "Opened in a new TWeb pane: $url"
+}
+
 function cmd_open {
   local url="$1"
   if [[ -z "$url" ]]; then
     echo "Usage: tmux-chrome open <url>" >&2
     return 1
   fi
+
+  try_tweb_open "$url" && return 0
 
   local group_name group_id window_id id response locator active
   group_name=$(tmux_current_window_title)
@@ -1963,6 +2010,8 @@ function main {
       echo "  delete          Delete tab group for current window"
       echo "  focus [app]     Bring app to foreground (chrome, slack, or any app name)"
       echo "  open <url>      Open URL directly into current window's tab group"
+      echo "                  (TMUX_CHROME_TWEB=1 sends it to a TWeb pane in this"
+      echo "                   window instead, splitting one if there is none)"
       echo "  add <url>       Add URL to current window's tab group"
       echo "  move            Move Chrome's active tab to current window's group"
       echo "  remove          Remove Chrome's active tab from its group"

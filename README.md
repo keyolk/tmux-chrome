@@ -76,6 +76,10 @@ tmux-chrome snapshot             # Save the current tab-group layout to JSON
 tmux-chrome restore              # Rebuild groups from the latest snapshot (re-groups loose tabs by URL)
 tmux-chrome restore <file>       # Rebuild from a specific snapshot
 
+# Open a URL
+tmux-chrome open <url>           # Into current window's tab group
+TMUX_CHROME_TWEB=1 tmux-chrome open <url>   # …into a TWeb pane in this window instead
+
 # Interactive
 tmux-chrome grab                 # Extract URLs from tmux panes → fzf multi-select → add to group
 tmux-chrome tabs                 # Browse current group's tabs via fzf → focus selected
@@ -89,6 +93,23 @@ tmux-chrome window-layout list
 tmux-chrome window-layout apply chrome-terminal
 tmux-chrome window-layout edit
 ```
+
+### Opening into TWeb instead of Chrome
+
+With `TMUX_CHROME_TWEB=1` set, `tmux-chrome open` — and the `$BROWSER` wrapper that
+forwards to it — hands the URL to [TWeb](https://github.com/keyolk/tweb) rather than to
+Chrome:
+
+- a TWeb pane already running **in the invoking pane's tmux window** gets a new tab
+- otherwise a pane is split into that window with the URL
+
+The window is matched by tmux window id against the pane that ran the command, not against
+whatever window the attached client happens to be looking at — so a background job opening a
+results page lands in its own window rather than the focused one.
+
+Any failure falls through to the ordinary Chrome path: no TWeb on `PATH`, a pane that will
+not take the tab, a split that will not start. A URL is never lost to a browser that is not
+there.
 
 ### From tmux.sh
 
