@@ -27,6 +27,8 @@ declare namespace Preferences {
   export type WindowLayout = ExtensionPreferences & {}
   /** Preferences accessible in the `clean-tabs` command */
   export type CleanTabs = ExtensionPreferences & {}
+  /** Preferences accessible in the `clean-orphan-groups` command */
+  export type CleanOrphanGroups = ExtensionPreferences & {}
 }
 
 declare namespace Arguments {
@@ -44,5 +46,7 @@ declare namespace Arguments {
   export type WindowLayout = {}
   /** Arguments passed to the `clean-tabs` command */
   export type CleanTabs = {}
+  /** Arguments passed to the `clean-orphan-groups` command */
+  export type CleanOrphanGroups = {}
 }
 

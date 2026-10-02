@@ -51,6 +51,12 @@
       "title": "Clean Ungrouped Tabs",
       "description": "Close all Chrome tabs not belonging to any tab group",
       "mode": "no-view"
+    },
+    {
+      "name": "clean-orphan-groups",
+      "title": "Clean Orphan Groups",
+      "description": "Remove Chrome tab groups that have no matching tmux window",
+      "mode": "view"
     }
   ],
   "dependencies": {
