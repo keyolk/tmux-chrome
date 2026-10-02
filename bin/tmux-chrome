@@ -46,19 +46,30 @@ finally:
 " 2>/dev/null
 }
 
+function bridge_ready {
+  # Alive, or revived. Every gate that decides whether to talk to the bridge
+  # goes through here rather than through bare `bridge_alive`.
+  #
+  # The distinction matters: the hook entry points (`switch`, `rename`) bail
+  # out with `return 0` when the bridge is down, by design — a closed Chrome
+  # should not make every window switch noisy. But bailing there means
+  # `chrome_cmd` is never reached, so putting the revival inside `chrome_cmd`
+  # alone left the hook path exactly as dead as before. Measured against the
+  # live bridge: with a stale socket, `switch` returned 0 and healed nothing.
+  bridge_alive && return 0
+  [[ -n "${TMUX_CHROME_NO_AUTOHEAL:-}" ]] && return 1
+  # Reviving means asking Chrome to reload the extension. Pointless with no
+  # Chrome, and it would turn every hook into a retry loop.
+  chrome_running || return 1
+  bridge_revive
+}
+
 function chrome_cmd {
   local json="$1"
 
-  if ! bridge_alive; then
-    # One self-heal attempt, then give up. Reviving the bridge means asking
-    # Chrome to reload the extension, which is cheap but not free; retrying it
-    # on every window switch while Chrome is closed would be a loop.
-    if [[ -z "${TMUX_CHROME_NO_AUTOHEAL:-}" ]] && chrome_running && bridge_revive; then
-      :
-    else
-      echo "Error: Chrome bridge not running" >&2
-      return 1
-    fi
+  if ! bridge_ready; then
+    echo "Error: Chrome bridge not running" >&2
+    return 1
   fi
 
   python3 -c "
@@ -248,7 +259,7 @@ function current_frontmost_app {
 # is created under $TMUX_CHROME_STATE_DIR.
 function snapshot_groups {
   local dest="${1:-}"
-  bridge_alive || return 1
+  bridge_ready || return 1
 
   local id response success
   id=$(request_id)
@@ -399,7 +410,7 @@ function cmd_rebind_all {
     dry_run=1
   fi
 
-  bridge_alive || { echo "Error: Chrome bridge not running" >&2; return 1; }
+  bridge_ready || { echo "Error: Chrome bridge not running" >&2; return 1; }
 
   local id response
   id=$(request_id)
@@ -459,7 +470,7 @@ function cmd_rebind_all {
 function cmd_switch {
   local window_name="${1:-$(tmux_current_window_title)}"
   tmux set-option -qw "${TMUX_PANE_TFLAG[@]}" @chrome_group "$window_name" 2>/dev/null
-  bridge_alive || return 0
+  bridge_ready || return 0
 
   # switch is the periodic sync hook — tmux window name is the source of truth.
   # Do NOT include the stale stored group_id/window_id in the locator: if the
@@ -512,7 +523,7 @@ function cmd_rename {
     return 0
   fi
 
-  bridge_alive || return 0
+  bridge_ready || return 0
   local id response locator
   id=$(request_id)
   locator=$(build_group_locator_json "$old_name" "$group_id" "$window_id")
@@ -1144,7 +1155,7 @@ function cmd_sync {
 # cmd_snapshot — manually capture the current tab-group layout to disk.
 function cmd_snapshot {
   local dest="${1:-}"
-  if ! bridge_alive; then
+  if ! bridge_ready; then
     echo "Error: Chrome bridge not running" >&2
     return 1
   fi
@@ -1174,7 +1185,7 @@ function cmd_restore {
     shift
   done
 
-  if ! bridge_alive; then
+  if ! bridge_ready; then
     echo "Error: Chrome bridge not running" >&2
     return 1
   fi
@@ -1271,7 +1282,7 @@ function cmd_picker {
 
   layouts_section=$(cmd_window_layout_list 2>/dev/null | awk -F '\t' '{ printf "layout:%s\t[layout] %s  (%s: %s)\n", $2, $3, $4, $5 }')
 
-  if bridge_alive && [[ -n "$group_name" ]]; then
+  if bridge_ready && [[ -n "$group_name" ]]; then
     local id response locator
     id=$(request_id)
     locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
