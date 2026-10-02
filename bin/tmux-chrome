@@ -25,12 +25,40 @@ SYNC_BULK_LIMIT="${TMUX_CHROME_SYNC_BULK_LIMIT:-2}"
 TMUX_PANE_TFLAG=()
 [[ -n "${TMUX_PANE:-}" ]] && TMUX_PANE_TFLAG=(-t "$TMUX_PANE")
 
+function bridge_alive {
+  # A live bridge means a socket that *accepts*, not a socket file that
+  # exists. bridge.py unlinks the path on startup but nothing removes it when
+  # Chrome tears the host down, so a dead bridge leaves a stale node behind
+  # and every `-S` check keeps passing. That is how the sync went quiet after
+  # Chrome restarted: the hook ran, connected to nothing, printed an error
+  # into `run-shell -b` where no one could see it, and exited 0.
+  [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 1
+  python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(1)
+try:
+    s.connect('$CHROME_BRIDGE_SOCKET')
+except Exception:
+    sys.exit(1)
+finally:
+    s.close()
+" 2>/dev/null
+}
+
 function chrome_cmd {
   local json="$1"
 
-  if [[ ! -S "$CHROME_BRIDGE_SOCKET" ]]; then
-    echo "Error: Chrome bridge not running (socket not found)" >&2
-    return 1
+  if ! bridge_alive; then
+    # One self-heal attempt, then give up. Reviving the bridge means asking
+    # Chrome to reload the extension, which is cheap but not free; retrying it
+    # on every window switch while Chrome is closed would be a loop.
+    if [[ -z "${TMUX_CHROME_NO_AUTOHEAL:-}" ]] && chrome_running && bridge_revive; then
+      :
+    else
+      echo "Error: Chrome bridge not running" >&2
+      return 1
+    fi
   fi
 
   python3 -c "
@@ -54,6 +82,42 @@ except Exception as e:
 finally:
     s.close()
 " 2>/dev/null
+}
+
+function chrome_running {
+  pgrep -x "Google Chrome" >/dev/null 2>&1
+}
+
+function bridge_revive {
+  # Serialise revival across the many hooks that can fire at once (select,
+  # rename, unlink). Without this a burst of window switches would each ask
+  # Chrome to reload the extension.
+  local lock="/tmp/tmux-chrome-revive.lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    # Another revive is in flight — wait for it rather than piling on.
+    local waited=0
+    while [[ -d "$lock" ]] && (( waited < 100 )); do
+      sleep 0.1
+      ((waited++)) || true
+    done
+    bridge_alive
+    return $?
+  fi
+  trap 'rmdir "$lock" 2>/dev/null || true' RETURN
+
+  osascript -e "
+    tell application \"Google Chrome\"
+      open location \"chrome-extension://$CHROME_EXTENSION_ID/reload.html\"
+    end tell
+  " >/dev/null 2>&1 || return 1
+
+  local tries=0
+  while (( tries < 20 )); do
+    sleep 0.25
+    bridge_alive && return 0
+    ((tries++)) || true
+  done
+  return 1
 }
 
 function request_id {
@@ -184,7 +248,7 @@ function current_frontmost_app {
 # is created under $TMUX_CHROME_STATE_DIR.
 function snapshot_groups {
   local dest="${1:-}"
-  [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 1
+  bridge_alive || return 1
 
   local id response success
   id=$(request_id)
@@ -302,21 +366,10 @@ function detect_tmux_terminal_app {
 function cmd_reload {
   echo "Reloading extension..."
 
-  # Navigate to extension's reload.html which calls chrome.runtime.reload()
-  osascript -e "
-    tell application \"Google Chrome\"
-      open location \"chrome-extension://$CHROME_EXTENSION_ID/reload.html\"
-    end tell
-  " 2>/dev/null
-
-  # Wait for socket to come back
-  local tries=0
-  while [[ ! -S "$CHROME_BRIDGE_SOCKET" ]] && [[ $tries -lt 15 ]]; do
-    sleep 0.5
-    ((tries++)) || true
-  done
-
-  if [[ -S "$CHROME_BRIDGE_SOCKET" ]]; then
+  # Reuse the same revival the hooks use, so the manual command and the
+  # automatic path cannot drift apart. It waits on an accepting socket, not
+  # on the file reappearing — the file may never have gone away.
+  if bridge_revive; then
     echo "Bridge reconnected"
   else
     echo "Error: Bridge did not reconnect" >&2
@@ -346,7 +399,7 @@ function cmd_rebind_all {
     dry_run=1
   fi
 
-  [[ -S "$CHROME_BRIDGE_SOCKET" ]] || { echo "Error: Chrome bridge not running" >&2; return 1; }
+  bridge_alive || { echo "Error: Chrome bridge not running" >&2; return 1; }
 
   local id response
   id=$(request_id)
@@ -406,7 +459,7 @@ function cmd_rebind_all {
 function cmd_switch {
   local window_name="${1:-$(tmux_current_window_title)}"
   tmux set-option -qw "${TMUX_PANE_TFLAG[@]}" @chrome_group "$window_name" 2>/dev/null
-  [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 0
+  bridge_alive || return 0
 
   # switch is the periodic sync hook — tmux window name is the source of truth.
   # Do NOT include the stale stored group_id/window_id in the locator: if the
@@ -459,7 +512,7 @@ function cmd_rename {
     return 0
   fi
 
-  [[ -S "$CHROME_BRIDGE_SOCKET" ]] || return 0
+  bridge_alive || return 0
   local id response locator
   id=$(request_id)
   locator=$(build_group_locator_json "$old_name" "$group_id" "$window_id")
@@ -1091,7 +1144,7 @@ function cmd_sync {
 # cmd_snapshot — manually capture the current tab-group layout to disk.
 function cmd_snapshot {
   local dest="${1:-}"
-  if [[ ! -S "$CHROME_BRIDGE_SOCKET" ]]; then
+  if ! bridge_alive; then
     echo "Error: Chrome bridge not running" >&2
     return 1
   fi
@@ -1121,7 +1174,7 @@ function cmd_restore {
     shift
   done
 
-  if [[ ! -S "$CHROME_BRIDGE_SOCKET" ]]; then
+  if ! bridge_alive; then
     echo "Error: Chrome bridge not running" >&2
     return 1
   fi
@@ -1218,7 +1271,7 @@ function cmd_picker {
 
   layouts_section=$(cmd_window_layout_list 2>/dev/null | awk -F '\t' '{ printf "layout:%s\t[layout] %s  (%s: %s)\n", $2, $3, $4, $5 }')
 
-  if [[ -S "$CHROME_BRIDGE_SOCKET" ]] && [[ -n "$group_name" ]]; then
+  if bridge_alive && [[ -n "$group_name" ]]; then
     local id response locator
     id=$(request_id)
     locator=$(build_group_locator_json "$group_name" "$group_id" "$window_id")
