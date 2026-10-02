@@ -45,7 +45,9 @@ make install
 make raycast-dev
 ```
 
-Registers Raycast commands for tab groups, tab browsing, tmux window switching, window swapping/distribution, saved workspace layouts, and sweeping ungrouped tabs.
+Registers Raycast commands for tab groups, tab browsing, tmux window switching, window swapping/distribution, saved workspace layouts, sweeping ungrouped tabs, and removing orphan groups.
+
+`Clean Orphan Groups` lists tab groups with no matching tmux window and removes the ones you pick. The automatic path (`sync`, run by the `window-unlinked` hook) stays report-only on purpose: it once ungrouped every group on a single mismatch, so deletion is a deliberate act rather than a side effect of closing a window. Tabs are ungrouped, never closed.
 
 ## Usage
 
