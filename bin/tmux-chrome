@@ -215,6 +215,24 @@ function tmux_current_window_title {
   tmux display-message "${TMUX_PANE_TFLAG[@]}" -p '#W' 2>/dev/null || true
 }
 
+# An empty title almost never means a window really named "". It means the
+# tmux server could not be reached. Seen 2026-10-08: something (likely macOS
+# /tmp cleanup) removed the socket directory while the server kept running —
+# recover with `mkdir -m700 <dir>; kill -USR1 <server pid>`. Attached clients
+# looked fine but
+# every hook's `tmux` call failed. Grouping under that empty name created a new
+# untitled Chrome group per call. Callers that would group by title go through
+# this instead of using the raw title.
+function require_window_title {
+  local title
+  title=$(tmux_current_window_title)
+  if [[ -z "$title" ]]; then
+    echo "Error: could not read the tmux window name (tmux server socket unreachable? ${TMUX%%,*})" >&2
+    return 1
+  fi
+  printf '%s\n' "$title"
+}
+
 function tmux_current_window_title_normalized {
   local raw
   raw=$(tmux display-message "${TMUX_PANE_TFLAG[@]}" -p '#W' 2>/dev/null || true)
@@ -468,7 +486,8 @@ function cmd_rebind_all {
 }
 
 function cmd_switch {
-  local window_name="${1:-$(tmux_current_window_title)}"
+  local window_name="${1:-}"
+  [[ -n "$window_name" ]] || window_name=$(require_window_title) || return 1
   tmux set-option -qw "${TMUX_PANE_TFLAG[@]}" @chrome_group "$window_name" 2>/dev/null
   bridge_ready || return 0
 
@@ -513,7 +532,7 @@ function cmd_switch {
 function cmd_rename {
   local old_name new_name group_id window_id
   old_name=$(tmux_get_group_title)
-  new_name=$(tmux_current_window_title)
+  new_name=$(require_window_title) || return 1
   group_id=$(tmux_get_group_id)
   window_id=$(tmux_get_group_window_id)
 
@@ -563,7 +582,8 @@ function cmd_list {
 }
 
 function cmd_delete {
-  local group_name="${1:-$(tmux_current_window_title)}"
+  local group_name="${1:-}"
+  [[ -n "$group_name" ]] || group_name=$(require_window_title) || return 1
   local group_id window_id id response locator
   group_id=$(tmux_get_group_id)
   window_id=$(tmux_get_group_window_id)
@@ -648,7 +668,12 @@ function cmd_open {
   try_tweb_open "$url" && return 0
 
   local group_name group_id window_id id response locator active
-  group_name=$(tmux_current_window_title)
+  if ! group_name=$(require_window_title); then
+    # Still open the URL — callers like $BROWSER expect a page, not an error —
+    # just without a group, instead of inventing an untitled one.
+    open -a "Google Chrome" "$url"
+    return
+  fi
   group_id=$(tmux_get_group_id)
   window_id=$(tmux_get_group_window_id)
   id=$(request_id)
@@ -694,7 +719,7 @@ function cmd_add {
     return 1
   fi
   local group_name group_id window_id id response locator
-  group_name=$(tmux_current_window_title)
+  group_name=$(require_window_title) || return 1
   group_id=$(tmux_get_group_id)
   window_id=$(tmux_get_group_window_id)
   id=$(request_id)
@@ -727,7 +752,7 @@ function cmd_add {
 
 function cmd_move {
   local group_name group_id window_id id response locator
-  group_name=$(tmux_current_window_title)
+  group_name=$(require_window_title) || return 1
   group_id=$(tmux_get_group_id)
   window_id=$(tmux_get_group_window_id)
   id=$(request_id)
@@ -927,7 +952,7 @@ function cmd_import_group {
 
 function cmd_grab {
   local group_name group_id window_id
-  group_name=$(tmux_current_window_title)
+  group_name=$(require_window_title) || return 1
   group_id=$(tmux_get_group_id)
   window_id=$(tmux_get_group_window_id)
   local window_index
@@ -994,7 +1019,7 @@ function cmd_grab {
 function cmd_tabs {
   local all_flag=""
   local group_name group_id window_id
-  group_name=$(tmux_current_window_title)
+  group_name=$(require_window_title) || return 1
   group_id=$(tmux_get_group_id)
   window_id=$(tmux_get_group_window_id)
 
@@ -1248,7 +1273,7 @@ function cmd_restore {
 
 function cmd_rebind_current_window {
   local group_name id response success
-  group_name=$(tmux_current_window_title)
+  group_name=$(require_window_title) || return 1
   id=$(request_id)
   response=$(chrome_cmd "{\"type\":\"pick_rebind_group\",\"id\":\"$id\"}")
   success=$(echo "$response" | jq -r '.success // false' 2>/dev/null)
