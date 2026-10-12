@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# tmux-socket-guard — re-create the default tmux server socket when it vanishes
+# under a live server. Run every 30s by launchd (com.keyolk.tmux-socket-guard).
+#
+# Seen 2026-10-08 and 2026-10-12: /private/tmp/tmux-$UID/default disappeared
+# while the server kept running. Attached clients kept working, but every new
+# `tmux` call (hooks, scripts, Claude's pane guard) failed until someone ran
+# `kill -USR1 <server pid>` by hand.
+#
+# Why record the owner instead of looking it up at heal time: more than one
+# tmux server can be alive (an older one whose socket was already lost), and
+# once the node is gone nothing on disk says which server it belonged to.
+# Signalling the wrong one would hand the path to a server the user is not
+# attached to. So while the socket is healthy we remember who answers on it.
+set -uo pipefail
+
+TMUX_BIN="${TMUX_BIN:-/opt/homebrew/bin/tmux}"
+SOCK_DIR="${TMUX_TMPDIR:-/private/tmp}/tmux-$(id -u)"
+SOCK="$SOCK_DIR/default"
+STATE_DIR="$HOME/.local/state/tmux-socket-guard"
+OWNER_FILE="$STATE_DIR/owner.pid"
+LOG="$STATE_DIR/guard.log"
+
+mkdir -p "$STATE_DIR"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+is_tmux_pid() {
+  [[ "$1" =~ ^[0-9]+$ ]] && [[ "$(ps -o comm= -p "$1" 2>/dev/null)" == *tmux ]]
+}
+
+if [[ -S "$SOCK" ]]; then
+  # Healthy: refresh the owner. `#{pid}` is the server's own pid.
+  owner=$("$TMUX_BIN" -S "$SOCK" display-message -p '#{pid}' 2>/dev/null) || owner=""
+  if is_tmux_pid "$owner"; then
+    [[ "$(cat "$OWNER_FILE" 2>/dev/null)" == "$owner" ]] || echo "$owner" >"$OWNER_FILE"
+  fi
+  exit 0
+fi
+
+owner=$(cat "$OWNER_FILE" 2>/dev/null || true)
+if ! is_tmux_pid "$owner"; then
+  # No server we know of — nothing to heal (tmux simply is not running).
+  exit 0
+fi
+
+# The detection timestamp is the evidence for finding whatever deletes it.
+log "socket $SOCK missing (dir $( [[ -d "$SOCK_DIR" ]] && echo present || echo missing )); signalling server $owner"
+mkdir -p "$SOCK_DIR" && chmod 700 "$SOCK_DIR"
+kill -USR1 "$owner" 2>/dev/null || { log "kill -USR1 $owner failed"; exit 1; }
+
+for _ in $(seq 20); do
+  if [[ -S "$SOCK" ]]; then
+    log "healed"
+    exit 0
+  fi
+  sleep 0.1
+done
+log "socket still missing after SIGUSR1"
+exit 1
