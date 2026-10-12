@@ -233,6 +233,57 @@ function require_window_title {
   printf '%s\n' "$title"
 }
 
+# Recreate the tmux server socket when it vanished under a live server.
+#
+# Seen 2026-10-08 and again 2026-10-12: the socket node (and its directory) was
+# removed while the server kept running. Clients already attached looked fine,
+# but every `tmux` call failed — including the ones inside our own hooks — and
+# nothing healed it until someone ran `kill -USR1` by hand. A hook is the one
+# place that can always repair this: `run-shell` exports TMUX="<socket>,<pid>,…"
+# naming the very server that spawned us, even after its socket file is gone.
+# SIGUSR1 makes tmux re-create the socket; the directory must exist first.
+function heal_tmux_socket {
+  [[ -n "${TMUX:-}" ]] || return 0
+  local sock="${TMUX%%,*}" rest="${TMUX#*,}"
+  local pid="${rest%%,*}"
+  [[ -S "$sock" ]] && return 0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  # A recycled pid must not receive our signal.
+  [[ "$(ps -o comm= -p "$pid" 2>/dev/null)" == *tmux ]] || return 1
+  mkdir -p "$(dirname "$sock")" 2>/dev/null || return 1
+  chmod 700 "$(dirname "$sock")" 2>/dev/null || return 1
+  kill -USR1 "$pid" 2>/dev/null || return 1
+  local tries=0
+  while (( tries < 20 )); do
+    [[ -S "$sock" ]] && { echo "healed tmux socket $sock (server $pid)" >&2; return 0; }
+    sleep 0.05
+    ((tries++)) || true
+  done
+  return 1
+}
+
+# Entry points wired to tmux hooks (switch, rename, sync --quiet) run under
+# `run-shell -b`, which paints any output — and "'…' returned 1" on a non-zero
+# exit — over the active pane. One unreachable tmux server therefore wrecked
+# every pane the user switched to. Outside a terminal, send output to a log
+# and always succeed; a hook has no one to report to. On a terminal (manual
+# runs), behave normally so errors stay visible.
+function hook_entry {
+  if [[ -t 2 ]]; then
+    "$@"
+    return
+  fi
+  local log="$TMUX_CHROME_STATE_DIR/hook.log" rc=0
+  mkdir -p "$TMUX_CHROME_STATE_DIR" 2>/dev/null || return 0
+  # Keep the log bounded; it is only ever read when something went wrong.
+  if [[ -f "$log" ]] && (( $(wc -c <"$log") > 1048576 )); then
+    tail -n 2000 "$log" >"$log.tmp" 2>/dev/null && mv "$log.tmp" "$log"
+  fi
+  "$@" >>"$log" 2>&1 || rc=$?
+  (( rc == 0 )) || printf '%s %s exited %d\n' "$(date '+%F %T')" "$*" "$rc" >>"$log"
+  return 0
+}
+
 function tmux_current_window_title_normalized {
   local raw
   raw=$(tmux display-message "${TMUX_PANE_TFLAG[@]}" -p '#W' 2>/dev/null || true)
@@ -2062,8 +2113,10 @@ function main {
   local subcmd="${1:-}"
   shift 2>/dev/null || true
 
+  heal_tmux_socket || true
+
   case "$subcmd" in
-    switch)  cmd_switch "$@" ;;
+    switch)  hook_entry cmd_switch "$@" ;;
     list)    cmd_list ;;
     delete)  cmd_delete "$@" ;;
     open)    cmd_open "$@" ;;
@@ -2076,10 +2129,17 @@ function main {
     clear-group) cmd_clear_group "$@" ;;
     grab)    cmd_grab ;;
     tabs)    cmd_tabs "$@" ;;
-    rename)  cmd_rename ;;
+    rename)  hook_entry cmd_rename ;;
     reload)  cmd_reload ;;
     clean)   cmd_clean ;;
-    sync)    cmd_sync "$@" ;;
+    sync)
+      # Only the quiet form is a hook; an interactive sync must keep its errors.
+      if [[ " $* " == *" --quiet "* || " $* " == *" -q "* ]]; then
+        hook_entry cmd_sync "$@"
+      else
+        cmd_sync "$@"
+      fi
+      ;;
     snapshot) cmd_snapshot "$@" ;;
     restore) cmd_restore "$@" ;;
     merge)   cmd_merge ;;
