@@ -9,8 +9,15 @@ url="$1"
 # Chrome path but not for the TWeb one, which talks to a pane rather than to the
 # extension — gating both on the socket sent every URL to the system browser
 # whenever Chrome's bridge happened to be down.
-if [[ -n "$TMUX" ]] && { [[ -S /tmp/tmux-chrome-bridge.sock ]] || [[ -n "$TMUX_CHROME_TWEB" ]]; }; then
-  exec tmux-chrome open "$url"
+#
+# Which one is tmux-chrome's call (`tmux-chrome browser`: env, then the pane's,
+# window's or global @browser option), so a Claude session that set its pane to
+# tweb gets TWeb even while the Chrome bridge is down.
+if [[ -n "$TMUX" ]]; then
+  case "$(tmux-chrome browser 2>/dev/null)" in
+    tweb | tweb-chrome) exec tmux-chrome open "$url" ;;
+  esac
+  [[ -S /tmp/tmux-chrome-bridge.sock ]] && exec tmux-chrome open "$url"
 fi
 
 # Fallback: open with system default
