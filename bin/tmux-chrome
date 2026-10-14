@@ -746,6 +746,22 @@ function try_tweb_open {
   echo "Opened in a new TWeb ($engine) pane: $url"
 }
 
+# The Claude Code session in this pane draws pages in its cockpit Web tab
+# (cc-mods bin/cc-browser) and set @cc_web to that bridge's socket. Hand the URL
+# to it when the target is a TWeb one; a dead socket falls through, so a URL is
+# never lost to a cockpit that closed.
+function try_cc_web {
+  local url="$1" sock target
+  [[ -n "${TMUX:-}" ]] || return 1
+  sock=$(tmux show-options -pqv "${TMUX_PANE_TFLAG[@]}" @cc_web 2>/dev/null)
+  [[ -n "$sock" && -S "$sock" ]] || return 1
+  target=$(browser_target)
+  [[ "$target" == tweb || "$target" == tweb-chrome ]] || return 1
+  curl -sf --max-time 10 --unix-socket "$sock" -X POST http://cc-browser/cmd \
+    -d "$(jq -cn --arg u "$url" '{argv: ["navigate", $u]}')" >/dev/null 2>&1 || return 1
+  echo "Opened in this session's cockpit Web tab: $url"
+}
+
 function cmd_open {
   local url="$1"
   if [[ -z "$url" ]]; then
@@ -753,6 +769,7 @@ function cmd_open {
     return 1
   fi
 
+  try_cc_web "$url" && return 0
   try_tweb_open "$url" && return 0
 
   local group_name group_id window_id id response locator active
