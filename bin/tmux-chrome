@@ -668,6 +668,7 @@ function cmd_focus {
 #   tweb         a TWeb pane on the Electron engine
 #   tweb-chrome  a TWeb pane on the user's own Chrome over CDP (Okta device
 #                trust, Endpoint Verification, policy extensions)
+#   tweb-webkit  a TWeb pane on macOS WebKit (`--engine webkit`, formerly tauri)
 #   chrome       a tab in this tmux window's Chrome tab group (the default)
 #
 # Resolved per call, most specific first, so one Claude session can browse in
@@ -676,7 +677,7 @@ function cmd_focus {
 #   2. the invoking pane's @browser option (cc-mods sets it per session)
 #   3. the window's @browser, then the global one (`tmux set -g @browser tweb`)
 #   4. TMUX_CHROME_TWEB=1, the old switch, as `tweb`
-# A value outside the three is reported on stderr and treated as `chrome`: a
+# A value outside these is reported on stderr and treated as `chrome`: a
 # typo must not lose the URL.
 function browser_target {
   local v="${TMUX_CHROME_BROWSER:-}"
@@ -689,9 +690,11 @@ function browser_target {
     v=tweb
   fi
   case "${v:-chrome}" in
-    tweb | tweb-chrome | chrome) printf '%s\n' "${v:-chrome}" ;;
+    tweb | tweb-chrome | tweb-webkit | chrome) printf '%s\n' "${v:-chrome}" ;;
+    # `--engine tauri` is tweb's alias for webkit; take the same spelling here.
+    tweb-tauri) printf 'tweb-webkit\n' ;;
     *)
-      echo "tmux-chrome: unknown browser target '$v' (tweb, tweb-chrome, chrome); using chrome" >&2
+      echo "tmux-chrome: unknown browser target '$v' (tweb, tweb-chrome, tweb-webkit, chrome); using chrome" >&2
       printf 'chrome\n'
       ;;
   esac
@@ -720,7 +723,7 @@ function tweb_pane_in_current_window {
   done < <(tweb panes --json 2>/dev/null | jq -r '.[] | select(.pane) | [.pane, (.status.browser // "electron")] | @tsv' 2>/dev/null)
 }
 
-# Hands the URL to TWeb when the target is tweb or tweb-chrome. Returns non-zero
+# Hands the URL to TWeb when the target is a TWeb one (tweb, tweb-chrome, tweb-webkit). Returns non-zero
 # when it did not, so the caller falls through to Chrome — a URL must never be
 # lost to a TWeb that is missing, broken, or not installed.
 function try_tweb_open {
@@ -729,6 +732,7 @@ function try_tweb_open {
   case "$target" in
     tweb) engine=electron ;;
     tweb-chrome) engine=chrome ;;
+    tweb-webkit) engine=webkit ;;
     *) return 1 ;;
   esac
   command -v tweb >/dev/null 2>&1 || return 1
@@ -756,7 +760,7 @@ function try_cc_web {
   sock=$(tmux show-options -pqv "${TMUX_PANE_TFLAG[@]}" @cc_web 2>/dev/null)
   [[ -n "$sock" && -S "$sock" ]] || return 1
   target=$(browser_target)
-  [[ "$target" == tweb || "$target" == tweb-chrome ]] || return 1
+  [[ "$target" == tweb || "$target" == tweb-chrome || "$target" == tweb-webkit ]] || return 1
   curl -sf --max-time 10 --unix-socket "$sock" -X POST http://cc-browser/cmd \
     -d "$(jq -cn --arg u "$url" '{argv: ["navigate", $u]}')" >/dev/null 2>&1 || return 1
   echo "Opened in this session's cockpit Web tab: $url"
@@ -2214,10 +2218,10 @@ function main {
       echo "  delete          Delete tab group for current window"
       echo "  focus [app]     Bring app to foreground (chrome, slack, or any app name)"
       echo "  open <url>      Open URL directly into current window's tab group"
-      echo "                  (@browser / TMUX_CHROME_BROWSER = tweb | tweb-chrome | chrome"
-      echo "                   picks TWeb on Electron, TWeb on your Chrome, or the tab group;"
+      echo "                  (@browser / TMUX_CHROME_BROWSER = tweb | tweb-chrome | tweb-webkit | chrome"
+      echo "                   picks TWeb on Electron, on your Chrome, on WebKit, or the tab group;"
       echo "                   pane, then window, then global option; default chrome)"
-      echo "  browser         Print where open sends a URL here: tweb, tweb-chrome or chrome"
+      echo "  browser         Print where open sends a URL here: tweb, tweb-chrome, tweb-webkit or chrome"
       echo "  add <url>       Add URL to current window's tab group"
       echo "  move            Move Chrome's active tab to current window's group"
       echo "  remove          Remove Chrome's active tab from its group"
