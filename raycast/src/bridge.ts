@@ -75,6 +75,19 @@ export interface Tab {
   url: string;
   group_title: string;
   group_id: number;
+  active?: boolean;
+  pinned?: boolean;
+  audible?: boolean;
+}
+
+export interface CloseTabRequest {
+  tab_id: number;
+  expected_url: string;
+}
+
+export interface CloseTabsResult {
+  closed: number[];
+  skipped: Array<{ tab_id?: number; reason: string }>;
 }
 
 export async function listGroups(): Promise<TabGroup[]> {
@@ -111,6 +124,12 @@ export async function raiseTabWindow(tabId: number): Promise<void> {
 
 export async function deleteGroup(name: string): Promise<void> {
   await bridgeRequest({ type: "delete_group", name });
+}
+
+export async function closeTabs(
+  tabs: CloseTabRequest[],
+): Promise<CloseTabsResult> {
+  return bridgeRequest<CloseTabsResult>({ type: "close_tabs", tabs });
 }
 
 export async function cleanTabs(): Promise<{ moved?: number; group?: string }> {

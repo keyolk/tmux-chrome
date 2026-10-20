@@ -45,7 +45,11 @@ make install
 make raycast-dev
 ```
 
-Registers Raycast commands for tab groups, tab browsing, tmux window switching, window swapping/distribution, saved workspace layouts, sweeping ungrouped tabs, and removing orphan groups.
+Registers Raycast commands for tab groups, tab browsing, tmux window switching, window swapping/distribution, saved workspace layouts, sweeping ungrouped tabs, removing orphan groups, and reviewing stale tabs.
+
+`Clean Stale Tabs` is the fast path: one command, one confirmation, then all API-verified ended PR tabs and exact successful OAuth callback tabs close together. It re-scans immediately before closing and the extension rechecks state before each removal. Open PRs, failed authentication, heuristic results, and tabs observed as active, pinned, audible, changed, or unverified stay open. Chrome does not offer a conditional tab-remove API, so the final state check and removal cannot be one atomic operation. `Review Stale Tabs` remains available for inspecting candidates and closing exceptions one at a time.
+
+`Review Stale Tabs` verifies ended GitHub pull requests through the authenticated `gh` CLI. It also recognizes exact terminal authentication URLs such as Claude MCP `auth_done`, localhost OAuth callbacks, and the authenticated Okta app dashboard. The command shows every candidate before closing it. Bulk cleanup includes only API-verified PRs and exact successful OAuth completion URLs. Active, pinned, audible, heuristic, changed, failed-authentication, and unverified tabs are excluded when observed. Set `GH_BIN` if `gh` is not installed at `/opt/homebrew/bin/gh`.
 
 `Clean Orphan Groups` lists tab groups with no matching tmux window and removes the ones you pick. The automatic path (`sync`, run by the `window-unlinked` hook) stays report-only on purpose: it once ungrouped every group on a single mismatch, so deletion is a deliberate act rather than a side effect of closing a window. Tabs are ungrouped, never closed.
 

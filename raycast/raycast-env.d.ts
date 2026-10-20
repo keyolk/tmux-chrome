@@ -29,6 +29,10 @@ declare namespace Preferences {
   export type CleanTabs = ExtensionPreferences & {}
   /** Preferences accessible in the `clean-orphan-groups` command */
   export type CleanOrphanGroups = ExtensionPreferences & {}
+  /** Preferences accessible in the `clean-stale-tabs` command */
+  export type CleanStaleTabs = ExtensionPreferences & {}
+  /** Preferences accessible in the `review-stale-tabs` command */
+  export type ReviewStaleTabs = ExtensionPreferences & {}
 }
 
 declare namespace Arguments {
@@ -48,5 +52,9 @@ declare namespace Arguments {
   export type CleanTabs = {}
   /** Arguments passed to the `clean-orphan-groups` command */
   export type CleanOrphanGroups = {}
+  /** Arguments passed to the `clean-stale-tabs` command */
+  export type CleanStaleTabs = {}
+  /** Arguments passed to the `review-stale-tabs` command */
+  export type ReviewStaleTabs = {}
 }
 
