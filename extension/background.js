@@ -17,6 +17,8 @@ let lastConnectTime = 0;
 // the tab the user was last on inside that group instead of always jumping
 // to the first tab.
 const lastActiveTabByGroup = new Map();
+const pendingCloseTabIds = new Set();
+const protectedDuringClose = new Set();
 
 let mutationQueue = Promise.resolve();
 
@@ -33,6 +35,9 @@ function rememberActiveTabForGroup(groupId, tabId) {
 }
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  if (pendingCloseTabIds.has(tabId)) {
+    protectedDuringClose.add(tabId);
+  }
   try {
     const tab = await chrome.tabs.get(tabId);
     rememberActiveTabForGroup(tab.groupId, tabId);
@@ -42,6 +47,12 @@ chrome.tabs.onActivated.addListener(async ({ tabId }) => {
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (
+    pendingCloseTabIds.has(tabId) &&
+    (tab.active || changeInfo.pinned === true || changeInfo.audible === true)
+  ) {
+    protectedDuringClose.add(tabId);
+  }
   if (changeInfo.groupId !== undefined && tab.active) {
     rememberActiveTabForGroup(tab.groupId, tabId);
   }
@@ -144,6 +155,8 @@ async function handleMessage(msg) {
       return getTabs(msg.name, msg.all, msg.active, msg.locator);
     case "focus_tab":
       return focusTab(msg.tab_id);
+    case "close_tabs":
+      return runSerialized(() => closeTabs(msg.tabs));
     case "raise_group_window":
       return raiseGroupWindow(msg.name, msg.group_id, msg.locator);
     case "raise_tab_window":
@@ -396,6 +409,9 @@ async function getTabs(groupName, all, active, locator) {
           url: t.url,
           group_title: g.title || "(untitled)",
           group_id: g.id,
+          active: t.active,
+          pinned: t.pinned,
+          audible: t.audible,
         });
       }
     }
@@ -419,6 +435,94 @@ async function getTabs(groupName, all, active, locator) {
     group_id: group.id,
   }));
   return tabs;
+}
+
+async function closeTabs(requestedTabs) {
+  if (!Array.isArray(requestedTabs) || requestedTabs.length === 0) {
+    return { closed: [], skipped: [] };
+  }
+
+  const validRequests = requestedTabs.filter(
+    (requested) =>
+      typeof requested?.tab_id === "number" &&
+      typeof requested?.expected_url === "string",
+  );
+  const closed = [];
+  const skipped = requestedTabs
+    .filter((requested) => !validRequests.includes(requested))
+    .map((requested) => ({
+      tab_id: requested?.tab_id,
+      reason: "invalid request",
+    }));
+
+  for (const requested of validRequests) {
+    pendingCloseTabIds.add(requested.tab_id);
+    protectedDuringClose.delete(requested.tab_id);
+  }
+
+  try {
+    for (const requested of validRequests) {
+      const tabId = requested.tab_id;
+      let tab;
+      try {
+        tab = await chrome.tabs.get(tabId);
+      } catch (_) {
+        skipped.push({ tab_id: tabId, reason: "tab no longer exists" });
+        continue;
+      }
+
+      if (tab.url !== requested.expected_url) {
+        skipped.push({ tab_id: tabId, reason: "URL changed" });
+        continue;
+      }
+      if (tab.active || protectedDuringClose.has(tabId)) {
+        skipped.push({ tab_id: tabId, reason: "tab became active" });
+        continue;
+      }
+      if (tab.pinned) {
+        skipped.push({ tab_id: tabId, reason: "tab is pinned" });
+        continue;
+      }
+      if (tab.audible) {
+        skipped.push({ tab_id: tabId, reason: "tab is playing audio" });
+        continue;
+      }
+
+      // Chrome has no conditional remove operation. Yield once, then fetch the
+      // tab again so activation, pin, and audio events can cancel the close.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      try {
+        tab = await chrome.tabs.get(tabId);
+      } catch (_) {
+        skipped.push({ tab_id: tabId, reason: "tab no longer exists" });
+        continue;
+      }
+      if (
+        tab.url !== requested.expected_url ||
+        tab.active ||
+        tab.pinned ||
+        tab.audible ||
+        protectedDuringClose.has(tabId)
+      ) {
+        skipped.push({ tab_id: tabId, reason: "tab changed during close" });
+        continue;
+      }
+
+      try {
+        await chrome.tabs.remove(tabId);
+        closed.push(tabId);
+      } catch (e) {
+        skipped.push({ tab_id: tabId, reason: e.message || "close failed" });
+      }
+    }
+  } finally {
+    for (const requested of validRequests) {
+      pendingCloseTabIds.delete(requested.tab_id);
+      protectedDuringClose.delete(requested.tab_id);
+    }
+  }
+
+  return { closed, skipped };
 }
 
 async function focusTab(tabId) {
