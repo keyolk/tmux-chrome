@@ -1,5 +1,5 @@
 import { Alert, confirmAlert, showHUD, showToast, Toast } from "@raycast/api";
-import { closeTabs, getAllTabs } from "./bridge";
+import { closeTabs, getCleanupTabs } from "./bridge";
 import { CleanupCandidate, findCleanupCandidates } from "./stale-tabs";
 
 function isProtected(candidate: CleanupCandidate): boolean {
@@ -13,7 +13,7 @@ function closable(candidates: CleanupCandidate[]): CleanupCandidate[] {
 }
 
 export default async function CleanStaleTabs() {
-  const initial = await findCleanupCandidates(await getAllTabs());
+  const initial = await findCleanupCandidates(await getCleanupTabs());
   const candidates = closable(initial.candidates);
   if (candidates.length === 0) {
     await showHUD(
@@ -28,13 +28,19 @@ export default async function CleanStaleTabs() {
   const githubCount = candidates.filter((candidate) =>
     candidate.kind.startsWith("github-pr-"),
   ).length;
-  const authCount = candidates.length - githubCount;
+  const authCount = candidates.filter(
+    (candidate) => candidate.kind === "oauth-complete",
+  ).length;
+  const leftoverCount = candidates.length - githubCount - authCount;
   const details = [
     githubCount
       ? `${githubCount} ended PR tab${githubCount === 1 ? "" : "s"}`
       : null,
     authCount
       ? `${authCount} completed auth tab${authCount === 1 ? "" : "s"}`
+      : null,
+    leftoverCount
+      ? `${leftoverCount} redirect/blank tab${leftoverCount === 1 ? "" : "s"}`
       : null,
     `${groups.size} tab group${groups.size === 1 ? "" : "s"}`,
   ]
@@ -55,7 +61,7 @@ export default async function CleanStaleTabs() {
     return;
   }
 
-  const fresh = await findCleanupCandidates(await getAllTabs());
+  const fresh = await findCleanupCandidates(await getCleanupTabs());
   const freshById = new Map(
     closable(fresh.candidates).map((candidate) => [candidate.id, candidate]),
   );

@@ -60,12 +60,50 @@ describe("classifyTerminalPage", () => {
     expect(result?.safeForBulkClose).toBe(false);
   });
 
-  test("keeps Okta dashboard out of bulk cleanup", () => {
+  test("closes the Okta dashboard left after SSO", () => {
     const result = classifyTerminalPage(
       tab("https://sendbird.okta.com/app/UserHome?session_hint=AUTHENTICATED"),
     );
     expect(result?.kind).toBe("oauth-complete");
-    expect(result?.safeForBulkClose).toBe(false);
+    expect(result?.safeForBulkClose).toBe(true);
+  });
+
+  test("classifies AWS SSO device authorization and Twingate auth", () => {
+    expect(
+      classifyTerminalPage(
+        tab(
+          "https://d-123.awsapps.com/start/#/?clientId=abc&clientType=cHVibGlj&deviceContextId=x",
+        ),
+      )?.kind,
+    ).toBe("oauth-complete");
+    expect(
+      classifyTerminalPage(
+        tab("https://sendbird.us1.twingate.com/client-auth-status"),
+      )?.kind,
+    ).toBe("oauth-complete");
+  });
+
+  test("classifies Slack desktop handoff interstitials", () => {
+    const result = classifyTerminalPage(
+      tab(
+        "https://sendbird.slack.com/archives/C1/p123",
+        "Redirecting… | Slack",
+      ),
+    );
+    expect(result?.kind).toBe("app-handoff");
+    expect(result?.safeForBulkClose).toBe(true);
+    expect(
+      classifyTerminalPage(
+        tab("https://sendbird.slack.com/archives/C1/p123", "general | Slack"),
+      ),
+    ).toBeNull();
+  });
+
+  test("classifies empty new tabs", () => {
+    expect(classifyTerminalPage(tab("chrome://newtab/"))?.kind).toBe(
+      "blank-tab",
+    );
+    expect(classifyTerminalPage(tab("about:blank"))?.kind).toBe("blank-tab");
   });
 
   test("does not classify login and AWS portal pages", () => {

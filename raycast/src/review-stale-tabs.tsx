@@ -11,7 +11,7 @@ import {
   showToast,
   Toast,
 } from "@raycast/api";
-import { closeTabs, focusTab, getAllTabs, raiseTabWindow } from "./bridge";
+import { closeTabs, focusTab, getCleanupTabs, raiseTabWindow } from "./bridge";
 import { CleanupCandidate, findCleanupCandidates } from "./stale-tabs";
 
 function kindLabel(candidate: CleanupCandidate): string {
@@ -24,6 +24,10 @@ function kindLabel(candidate: CleanupCandidate): string {
       return "Auth complete";
     case "oauth-error":
       return "Auth error";
+    case "app-handoff":
+      return "Opened in app";
+    case "blank-tab":
+      return "Blank tab";
     case "page-error":
       return "Page error";
   }
@@ -37,6 +41,9 @@ function kindColor(candidate: CleanupCandidate): Color {
       return Color.Red;
     case "oauth-complete":
       return Color.Green;
+    case "app-handoff":
+    case "blank-tab":
+      return Color.SecondaryText;
     case "oauth-error":
     case "page-error":
       return Color.Orange;
@@ -64,7 +71,7 @@ export default function ReviewStaleTabs() {
     setGithubError(null);
     setError(null);
     try {
-      const tabs = await getAllTabs();
+      const tabs = await getCleanupTabs();
       const scan = await findCleanupCandidates(tabs);
       setCandidates(scan.candidates);
       setGithubError(scan.githubError ?? null);
@@ -82,7 +89,7 @@ export default function ReviewStaleTabs() {
   async function revalidate(
     selected: CleanupCandidate[],
   ): Promise<CleanupCandidate[]> {
-    const fresh = await findCleanupCandidates(await getAllTabs());
+    const fresh = await findCleanupCandidates(await getCleanupTabs());
     return selected.filter((candidate) =>
       fresh.candidates.some(
         (current) =>

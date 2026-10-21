@@ -10,6 +10,8 @@ export type CandidateKind =
   | "github-pr-closed"
   | "oauth-complete"
   | "oauth-error"
+  | "app-handoff"
+  | "blank-tab"
   | "page-error";
 
 export interface CleanupCandidate extends Tab {
@@ -80,6 +82,8 @@ export function classifyTerminalPage(tab: Tab): CleanupCandidate | null {
     );
   }
 
+  // Okta lands here after an SP-initiated SSO finishes; the user never opens
+  // the dashboard on purpose, so the tab is leftover from a login.
   if (
     url.hostname === "sendbird.okta.com" &&
     url.pathname === "/app/UserHome" &&
@@ -89,8 +93,56 @@ export function classifyTerminalPage(tab: Tab): CleanupCandidate | null {
       tab,
       "oauth-complete",
       "Okta returned to the authenticated app dashboard",
-      false,
+      true,
     );
+  }
+
+  // `aws sso login` opens the portal with the device-flow client in the hash.
+  // A plain portal visit has no clientId, so it stays out of cleanup.
+  if (
+    url.hostname.endsWith(".awsapps.com") &&
+    url.pathname === "/start/" &&
+    new URLSearchParams(url.hash.replace(/^#\/?\??/, "")).has("clientId")
+  ) {
+    return candidate(
+      tab,
+      "oauth-complete",
+      "AWS SSO device authorization page",
+      true,
+    );
+  }
+
+  if (
+    url.hostname.endsWith(".twingate.com") &&
+    url.pathname === "/client-auth-status"
+  ) {
+    return candidate(
+      tab,
+      "oauth-complete",
+      "Twingate client authentication finished",
+      true,
+    );
+  }
+
+  // Slack permalinks hand off to the desktop app and leave this interstitial.
+  if (
+    url.hostname.endsWith(".slack.com") &&
+    tab.title.startsWith("Redirecting")
+  ) {
+    return candidate(
+      tab,
+      "app-handoff",
+      "Slack opened the link in the desktop app",
+      true,
+    );
+  }
+
+  if (
+    tab.url === "chrome://newtab/" ||
+    tab.url === "about:blank" ||
+    url.hostname === "newtab"
+  ) {
+    return candidate(tab, "blank-tab", "Empty new tab", true);
   }
 
   if (
