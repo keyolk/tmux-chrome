@@ -163,8 +163,13 @@ async function handleMessage(msg) {
       return raiseTabWindow(msg.tab_id);
     case "rename_group":
       return runSerialized(() => renameGroup(msg.old_name, msg.new_name, msg.locator));
+    case "reload_extension":
+      // Reply first: runtime.reload() tears down the native port, and the
+      // caller treats a new host process as proof the reload happened.
+      setTimeout(() => chrome.runtime.reload(), 100);
+      return { reloading: true };
     case "clean_tabs":
-      return runSerialized(() => cleanTabs());
+      return runSerialized(() => cleanTabs(msg.min_idle_ms));
     case "regroup_tabs":
       return runSerialized(() => regroupTabs(msg.name, msg.urls, msg.reopen_missing));
     case "merge_windows":
@@ -236,12 +241,13 @@ async function switchWindow(windowName, locator) {
   return { matched: true, group_id: group.id, window_id: group.windowId, group_title: group.title || windowName, tab_id: target.id };
 }
 
-async function ensureReservedNativeGroup() {
+// Seed a missing group with the tabs being swept rather than a fresh blank tab:
+// the blank tab used to outlive the sweep as a stray "New Tab".
+async function ensureReservedNativeGroup(seedTabIds) {
   let group = await findGroupByTitle(RESERVED_GROUP_TITLE);
   if (group) return group;
 
-  const tab = await chrome.tabs.create({ active: false });
-  const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+  const groupId = await chrome.tabs.group({ tabIds: seedTabIds });
   await chrome.tabGroups.update(groupId, {
     title: RESERVED_GROUP_TITLE,
     collapsed: true,
@@ -412,6 +418,7 @@ async function getTabs(groupName, all, active, locator, includeUngrouped) {
           active: t.active,
           pinned: t.pinned,
           audible: t.audible,
+          last_accessed: t.lastAccessed,
         });
       }
     }
@@ -429,6 +436,7 @@ async function getTabs(groupName, all, active, locator, includeUngrouped) {
           active: t.active,
           pinned: t.pinned,
           audible: t.audible,
+          last_accessed: t.lastAccessed,
         });
       }
     }
@@ -592,26 +600,34 @@ async function renameGroup(oldName, newName, locator) {
   return { group_id: group.id, window_id: group.windowId, old_name: oldName, new_name: updated.title || newName };
 }
 
-async function cleanTabs() {
-  const nativeGroup = await ensureReservedNativeGroup();
+// minIdleMs is set by the periodic sweep: it leaves the tab the user is on and
+// tabs touched within that window alone, so a tab just opened with Cmd+T is not
+// pulled into a collapsed group mid-use. Tabs without lastAccessed are skipped
+// for the same reason.
+async function cleanTabs(minIdleMs) {
   const allTabs = await chrome.tabs.query({});
+  const now = Date.now();
   const ungrouped = allTabs.filter(
-    (t) => t.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE
+    (t) =>
+      t.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE &&
+      (typeof minIdleMs !== "number" ||
+        (!t.active &&
+          !t.pinned &&
+          typeof t.lastAccessed === "number" &&
+          now - t.lastAccessed >= minIdleMs))
   );
-
-  if (ungrouped.length === 0) return { moved: 0, group: RESERVED_GROUP_TITLE };
 
   const tabIds = ungrouped
     .map((t) => t.id)
     .filter((id) => id !== undefined && id !== null);
+  if (tabIds.length === 0) return { moved: 0, group: RESERVED_GROUP_TITLE };
 
-  if (tabIds.length > 0) {
-    await chrome.tabs.group({ tabIds, groupId: nativeGroup.id });
-    await chrome.tabGroups.update(nativeGroup.id, {
-      title: RESERVED_GROUP_TITLE,
-      collapsed: true,
-    });
-  }
+  const nativeGroup = await ensureReservedNativeGroup(tabIds);
+  await chrome.tabs.group({ tabIds, groupId: nativeGroup.id });
+  await chrome.tabGroups.update(nativeGroup.id, {
+    title: RESERVED_GROUP_TITLE,
+    collapsed: true,
+  });
 
   return { moved: tabIds.length, group: RESERVED_GROUP_TITLE };
 }

@@ -79,6 +79,24 @@
       "description": "Review and close ended GitHub PR and completed authentication tabs",
       "icon": "review-stale-tabs.png",
       "mode": "view"
+    },
+    {
+      "name": "auto-clean-tabs",
+      "title": "Auto Clean Tabs",
+      "description": "Every 15 minutes, close idle stale tabs and sweep idle ungrouped tabs into the native group",
+      "icon": "clean-stale-tabs.png",
+      "mode": "no-view",
+      "interval": "15m",
+      "preferences": [
+        {
+          "name": "idleMinutes",
+          "type": "textfield",
+          "required": false,
+          "default": "30",
+          "title": "Idle Minutes",
+          "description": "Only touch tabs not accessed for at least this many minutes"
+        }
+      ]
     }
   ],
   "dependencies": {

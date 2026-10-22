@@ -443,16 +443,44 @@ function detect_tmux_terminal_app {
   return 1
 }
 
+function bridge_host_pid {
+  pgrep -f "host/bridge.py chrome-extension://$CHROME_EXTENSION_ID/" | head -1
+}
+
 function cmd_reload {
   echo "Reloading extension..."
 
+  # With a live bridge, ask the extension to reload itself. The reload.html
+  # route below opens in whichever Chrome profile is frontmost, so with the
+  # extension in another profile it silently did nothing while the old bridge
+  # kept answering — and this command still printed success. A new host
+  # process is the proof: runtime.reload() drops the native port.
+  local old_pid
+  old_pid="$(bridge_host_pid)"
+  if [[ -n "$old_pid" ]] && bridge_alive &&
+    chrome_cmd '{"type":"reload_extension","id":"reload"}' | grep -q '"success": *true'; then
+    local tries=0
+    while (( tries < 40 )); do
+      sleep 0.25
+      local pid
+      pid="$(bridge_host_pid)"
+      if [[ -n "$pid" && "$pid" != "$old_pid" ]] && bridge_alive; then
+        echo "Bridge reconnected"
+        return 0
+      fi
+      ((tries++)) || true
+    done
+    echo "Error: Extension did not come back after reload" >&2
+    return 1
+  fi
+
+  # Bridge down, or an extension too old to know reload_extension.
   # Reuse the same revival the hooks use, so the manual command and the
-  # automatic path cannot drift apart. It waits on an accepting socket, not
-  # on the file reappearing — the file may never have gone away.
-  if bridge_revive; then
+  # automatic path cannot drift apart.
+  if bridge_revive && [[ -z "$old_pid" || "$(bridge_host_pid)" != "$old_pid" ]]; then
     echo "Bridge reconnected"
   else
-    echo "Error: Bridge did not reconnect" >&2
+    echo "Error: Extension was not reloaded. Reload it from chrome://extensions in the profile that has it." >&2
     return 1
   fi
 }
