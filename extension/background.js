@@ -624,10 +624,18 @@ async function cleanTabs(minIdleMs) {
 
   const nativeGroup = await ensureReservedNativeGroup(tabIds);
   await chrome.tabs.group({ tabIds, groupId: nativeGroup.id });
-  await chrome.tabGroups.update(nativeGroup.id, {
-    title: RESERVED_GROUP_TITLE,
-    collapsed: true,
+  // Collapsing a group that holds its window's active tab makes Chrome switch
+  // to another tab. The unattended sweep must not change what the user sees.
+  const [activeInGroup] = await chrome.tabs.query({
+    groupId: nativeGroup.id,
+    active: true,
   });
+  if (typeof minIdleMs !== "number" || !activeInGroup) {
+    await chrome.tabGroups.update(nativeGroup.id, {
+      title: RESERVED_GROUP_TITLE,
+      collapsed: true,
+    });
+  }
 
   return { moved: tabIds.length, group: RESERVED_GROUP_TITLE };
 }
