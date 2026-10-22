@@ -78,6 +78,7 @@ export interface Tab {
   active?: boolean;
   pinned?: boolean;
   audible?: boolean;
+  last_accessed?: number;
 }
 
 export interface CloseTabRequest {
@@ -142,8 +143,11 @@ export async function closeTabs(
   return bridgeRequest<CloseTabsResult>({ type: "close_tabs", tabs });
 }
 
-export async function cleanTabs(): Promise<{ moved?: number; group?: string }> {
+export async function cleanTabs(
+  minIdleMs?: number,
+): Promise<{ moved?: number; group?: string }> {
   return bridgeRequest<{ moved?: number; group?: string }>({
     type: "clean_tabs",
+    ...(minIdleMs === undefined ? {} : { min_idle_ms: minIdleMs }),
   });
 }

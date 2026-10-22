@@ -292,3 +292,22 @@ export async function findCleanupCandidates(tabs: Tab[]): Promise<CleanupScan> {
 
   return { candidates, githubError };
 }
+
+// The periodic cleanup runs with nobody confirming, so on top of the bulk-close
+// rules it only takes tabs the user has not touched for minIdleMs. A tab whose
+// last access time is unknown is treated as recently used.
+export function selectUnattendedClose(
+  candidates: CleanupCandidate[],
+  minIdleMs: number,
+  now: number,
+): CleanupCandidate[] {
+  return candidates.filter(
+    (candidate) =>
+      candidate.safeForBulkClose &&
+      !candidate.active &&
+      !candidate.pinned &&
+      !candidate.audible &&
+      typeof candidate.last_accessed === "number" &&
+      now - candidate.last_accessed >= minIdleMs,
+  );
+}

@@ -33,6 +33,11 @@ declare namespace Preferences {
   export type CleanStaleTabs = ExtensionPreferences & {}
   /** Preferences accessible in the `review-stale-tabs` command */
   export type ReviewStaleTabs = ExtensionPreferences & {}
+  /** Preferences accessible in the `auto-clean-tabs` command */
+  export type AutoCleanTabs = ExtensionPreferences & {
+  /** Idle Minutes - Only touch tabs not accessed for at least this many minutes */
+  "idleMinutes": string
+}
 }
 
 declare namespace Arguments {
@@ -56,5 +61,7 @@ declare namespace Arguments {
   export type CleanStaleTabs = {}
   /** Arguments passed to the `review-stale-tabs` command */
   export type ReviewStaleTabs = {}
+  /** Arguments passed to the `auto-clean-tabs` command */
+  export type AutoCleanTabs = {}
 }
 

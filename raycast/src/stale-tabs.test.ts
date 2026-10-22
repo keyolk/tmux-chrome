@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { Tab } from "./bridge";
-import { classifyTerminalPage, parsePullRequestUrl } from "./stale-tabs";
+import {
+  classifyTerminalPage,
+  parsePullRequestUrl,
+  selectUnattendedClose,
+} from "./stale-tabs";
 
 function tab(url: string, title = "Example"): Tab {
   return {
@@ -113,5 +117,33 @@ describe("classifyTerminalPage", () => {
     expect(
       classifyTerminalPage(tab("https://example.awsapps.com/start/#/")),
     ).toBeNull();
+  });
+});
+
+describe("selectUnattendedClose", () => {
+  const now = 10 * 60_000;
+  function blank(overrides: Partial<Tab>) {
+    const result = classifyTerminalPage({ ...tab("chrome://newtab/"), ...overrides });
+    if (!result) throw new Error("expected a candidate");
+    return result;
+  }
+
+  test("closes only idle, unprotected, bulk-safe tabs", () => {
+    const idle = blank({ id: 1, last_accessed: 0 });
+    const recent = blank({ id: 2, last_accessed: now - 60_000 });
+    const unknown = blank({ id: 3 });
+    const active = blank({ id: 4, last_accessed: 0, active: true });
+    const pinned = blank({ id: 5, last_accessed: 0, pinned: true });
+    const okta = classifyTerminalPage({
+      ...tab("http://localhost:3000/oauth/callback?error=denied"),
+      last_accessed: 0,
+    });
+    expect(
+      selectUnattendedClose(
+        [idle, recent, unknown, active, pinned, okta!],
+        5 * 60_000,
+        now,
+      ).map((candidate) => candidate.id),
+    ).toEqual([1]);
   });
 });
