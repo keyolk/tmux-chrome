@@ -83,10 +83,10 @@
     {
       "name": "auto-clean-tabs",
       "title": "Auto Clean Tabs",
-      "description": "Every 15 minutes, close idle stale tabs and sweep idle ungrouped tabs into the native group",
+      "description": "Every hour, close idle stale tabs and sweep idle ungrouped tabs into the native group",
       "icon": "clean-stale-tabs.png",
       "mode": "no-view",
-      "interval": "15m",
+      "interval": "1h",
       "preferences": [
         {
           "name": "idleMinutes",
