@@ -444,7 +444,9 @@ function detect_tmux_terminal_app {
 }
 
 function bridge_host_pid {
-  pgrep -f "host/bridge.py chrome-extension://$CHROME_EXTENSION_ID/" | head -1
+  # Empty, not a failure, while no host runs: under `set -eo pipefail` a
+  # non-zero pgrep killed `reload` silently mid-wait.
+  pgrep -f "host/bridge.py chrome-extension://$CHROME_EXTENSION_ID/" | head -1 || true
 }
 
 function cmd_reload {
@@ -459,10 +461,10 @@ function cmd_reload {
   old_pid="$(bridge_host_pid)"
   if [[ -n "$old_pid" ]] && bridge_alive &&
     chrome_cmd '{"type":"reload_extension","id":"reload"}' | grep -q '"success": *true'; then
-    local tries=0
-    while (( tries < 40 )); do
+    # Measured: the new host appeared ~15s after the old one dropped.
+    local tries=0 pid
+    while (( tries < 120 )); do
       sleep 0.25
-      local pid
       pid="$(bridge_host_pid)"
       if [[ -n "$pid" && "$pid" != "$old_pid" ]] && bridge_alive; then
         echo "Bridge reconnected"
