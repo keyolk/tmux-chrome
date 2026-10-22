@@ -152,7 +152,7 @@ async function handleMessage(msg) {
     case "remove_tab":
       return runSerialized(() => removeTab());
     case "get_tabs":
-      return getTabs(msg.name, msg.all, msg.active, msg.locator);
+      return getTabs(msg.name, msg.all, msg.active, msg.locator, msg.include_ungrouped);
     case "focus_tab":
       return focusTab(msg.tab_id);
     case "close_tabs":
@@ -394,7 +394,7 @@ async function getActiveGroup() {
   return group ?? null;
 }
 
-async function getTabs(groupName, all, active, locator) {
+async function getTabs(groupName, all, active, locator, includeUngrouped) {
   let tabs;
   let group = null;
   if (all) {
@@ -409,6 +409,23 @@ async function getTabs(groupName, all, active, locator) {
           url: t.url,
           group_title: g.title || "(untitled)",
           group_id: g.id,
+          active: t.active,
+          pinned: t.pinned,
+          audible: t.audible,
+        });
+      }
+    }
+    if (includeUngrouped) {
+      const ungrouped = await chrome.tabs.query({
+        groupId: chrome.tabGroups.TAB_GROUP_ID_NONE,
+      });
+      for (const t of ungrouped) {
+        tabs.push({
+          id: t.id,
+          title: t.title,
+          url: t.url,
+          group_title: "(ungrouped)",
+          group_id: chrome.tabGroups.TAB_GROUP_ID_NONE,
           active: t.active,
           pinned: t.pinned,
           audible: t.audible,

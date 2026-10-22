@@ -102,6 +102,16 @@ export async function getAllTabs(): Promise<Tab[]> {
   return bridgeRequest<Tab[]>({ type: "get_tabs", all: true });
 }
 
+// Cleanup also scans tabs outside any group: blank and redirect tabs are
+// usually opened there before `clean_tabs` sweeps them into a group.
+export async function getCleanupTabs(): Promise<Tab[]> {
+  return bridgeRequest<Tab[]>({
+    type: "get_tabs",
+    all: true,
+    include_ungrouped: true,
+  });
+}
+
 export async function getTabsForGroup(name: string): Promise<Tab[]> {
   return bridgeRequest<Tab[]>({ type: "get_tabs", name });
 }
