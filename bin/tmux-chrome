@@ -664,49 +664,106 @@ function cmd_focus {
   esac
 }
 
-# Whether TWeb should take this URL instead of Chrome, and how.
+# Where `open` sends a URL. One of:
+#   tweb         a TWeb pane on the Electron engine
+#   tweb-chrome  a TWeb pane on the user's own Chrome over CDP (Okta device
+#                trust, Endpoint Verification, policy extensions)
+#   tweb-webkit  a TWeb pane on macOS WebKit (`--engine webkit`, formerly tauri)
+#   chrome       a tab in this tmux window's Chrome tab group (the default)
 #
-# Prints the pane id of a TWeb pane already running in THIS tmux window, or the
-# empty string when there is none. The caller decides between a new tab in that
-# pane and a fresh split; both are TWeb, and the difference is only whether a
-# pane has to be created.
+# Resolved per call, most specific first, so one Claude session can browse in
+# TWeb while the rest of the window keeps Chrome:
+#   1. TMUX_CHROME_BROWSER in the environment
+#   2. the invoking pane's @browser option (cc-mods sets it per session)
+#   3. the window's @browser, then the global one (`tmux set -g @browser tweb`)
+#   4. TMUX_CHROME_TWEB=1, the old switch, as `tweb`
+# A value outside these is reported on stderr and treated as `chrome`: a
+# typo must not lose the URL.
+function browser_target {
+  local v="${TMUX_CHROME_BROWSER:-}"
+  if [[ -z "$v" && -n "${TMUX:-}" ]]; then
+    v=$(tmux show-options -pqv "${TMUX_PANE_TFLAG[@]}" @browser 2>/dev/null)
+    [[ -z "$v" ]] && v=$(tmux show-options -wqv "${TMUX_PANE_TFLAG[@]}" @browser 2>/dev/null)
+    [[ -z "$v" ]] && v=$(tmux show-options -gqv @browser 2>/dev/null)
+  fi
+  if [[ -z "$v" && -n "${TMUX_CHROME_TWEB:-}" && "${TMUX_CHROME_TWEB}" != "0" ]]; then
+    v=tweb
+  fi
+  case "${v:-chrome}" in
+    tweb | tweb-chrome | tweb-webkit | chrome) printf '%s\n' "${v:-chrome}" ;;
+    # `--engine tauri` is tweb's alias for webkit; take the same spelling here.
+    tweb-tauri) printf 'tweb-webkit\n' ;;
+    *)
+      echo "tmux-chrome: unknown browser target '$v' (tweb, tweb-chrome, tweb-webkit, chrome); using chrome" >&2
+      printf 'chrome\n'
+      ;;
+  esac
+}
+
+# The TWeb pane in the caller's tmux window running the given engine (TWeb
+# reports `chrome` for the CDP engine, `electron` otherwise), or an empty string
+# when there is none. A pane on the other engine does not count: a URL meant
+# for managed Chrome must not land in Electron, where device trust fails.
 #
 # Window id rather than session plus name: it is unique per tmux server, so one
 # comparison settles it, and it survives a window being renamed underneath us.
 function tweb_pane_in_current_window {
-  local pane current
+  local engine="$1" pane browser current
   current=$(tmux display-message "${TMUX_PANE_TFLAG[@]}" -p '#{window_id}' 2>/dev/null)
   [[ -z "$current" ]] && return 0
 
-  while read -r pane; do
+  while IFS=$'\t' read -r pane browser; do
     [[ -z "$pane" ]] && continue
+    [[ "${browser:-electron}" == "$engine" ]] || continue
     # A pane TWeb still lists can be gone from tmux — the engine outlives its pane
     # briefly on exit — so this doubles as the liveness check.
     [[ "$(tmux display-message -t "$pane" -p '#{window_id}' 2>/dev/null)" == "$current" ]] || continue
     printf '%s\n' "$pane"
     return 0
-  done < <(tweb panes --json 2>/dev/null | jq -r '.[].pane // empty' 2>/dev/null)
+  done < <(tweb panes --json 2>/dev/null | jq -r '.[] | select(.pane) | [.pane, (.status.browser // "electron")] | @tsv' 2>/dev/null)
 }
 
-# Hands the URL to TWeb when TMUX_CHROME_TWEB is set. Returns non-zero when it
-# did not, so the caller falls through to Chrome — a URL must never be lost to a
-# TWeb that is missing, broken, or not installed.
+# Hands the URL to TWeb when the target is a TWeb one (tweb, tweb-chrome, tweb-webkit). Returns non-zero
+# when it did not, so the caller falls through to Chrome — a URL must never be
+# lost to a TWeb that is missing, broken, or not installed.
 function try_tweb_open {
-  local url="$1" pane
-  [[ -z "$TMUX_CHROME_TWEB" || "$TMUX_CHROME_TWEB" == "0" ]] && return 1
+  local url="$1" target engine pane
+  target=$(browser_target)
+  case "$target" in
+    tweb) engine=electron ;;
+    tweb-chrome) engine=chrome ;;
+    tweb-webkit) engine=webkit ;;
+    *) return 1 ;;
+  esac
   command -v tweb >/dev/null 2>&1 || return 1
 
-  pane=$(tweb_pane_in_current_window)
+  pane=$(tweb_pane_in_current_window "$engine")
   if [[ -n "$pane" ]]; then
     tweb tab new --pane "$pane" "$url" >/dev/null 2>&1 || return 1
-    echo "Opened in TWeb pane $pane: $url"
+    echo "Opened in TWeb ($engine) pane $pane: $url"
     return 0
   fi
 
   # No pane here yet, so make one. The split lands in the caller's window, which
   # is the same window this just looked in.
-  tweb split "$url" >/dev/null 2>&1 || return 1
-  echo "Opened in a new TWeb pane: $url"
+  tweb split --engine "$engine" "$url" >/dev/null 2>&1 || return 1
+  echo "Opened in a new TWeb ($engine) pane: $url"
+}
+
+# The Claude Code session in this pane draws pages in its cockpit Web tab
+# (cc-mods bin/cc-browser) and set @cc_web to that bridge's socket. Hand the URL
+# to it when the target is a TWeb one; a dead socket falls through, so a URL is
+# never lost to a cockpit that closed.
+function try_cc_web {
+  local url="$1" sock target
+  [[ -n "${TMUX:-}" ]] || return 1
+  sock=$(tmux show-options -pqv "${TMUX_PANE_TFLAG[@]}" @cc_web 2>/dev/null)
+  [[ -n "$sock" && -S "$sock" ]] || return 1
+  target=$(browser_target)
+  [[ "$target" == tweb || "$target" == tweb-chrome || "$target" == tweb-webkit ]] || return 1
+  curl -sf --max-time 10 --unix-socket "$sock" -X POST http://cc-browser/cmd \
+    -d "$(jq -cn --arg u "$url" '{argv: ["navigate", $u]}')" >/dev/null 2>&1 || return 1
+  echo "Opened in this session's cockpit Web tab: $url"
 }
 
 function cmd_open {
@@ -716,6 +773,7 @@ function cmd_open {
     return 1
   fi
 
+  try_cc_web "$url" && return 0
   try_tweb_open "$url" && return 0
 
   local group_name group_id window_id id response locator active
@@ -2147,11 +2205,12 @@ function main {
     rebind-current-window) cmd_rebind_current_window ;;
     rebind-all) cmd_rebind_all "$@" ;;
     picker)  cmd_picker ;;
+    browser) browser_target ;;
     swap-window) cmd_swap_window ;;
     window-layout) cmd_window_layout "$@" ;;
     distribute|distribute-windows) cmd_distribute_windows ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|snapshot|restore|merge|cycle-tab|rebind-current-window|rebind-all|picker|swap-window|window-layout|distribute}"
+      echo "Usage: tmux-chrome {switch|list|delete|open|browser|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|snapshot|restore|merge|cycle-tab|rebind-current-window|rebind-all|picker|swap-window|window-layout|distribute}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -2159,8 +2218,10 @@ function main {
       echo "  delete          Delete tab group for current window"
       echo "  focus [app]     Bring app to foreground (chrome, slack, or any app name)"
       echo "  open <url>      Open URL directly into current window's tab group"
-      echo "                  (TMUX_CHROME_TWEB=1 sends it to a TWeb pane in this"
-      echo "                   window instead, splitting one if there is none)"
+      echo "                  (@browser / TMUX_CHROME_BROWSER = tweb | tweb-chrome | tweb-webkit | chrome"
+      echo "                   picks TWeb on Electron, on your Chrome, on WebKit, or the tab group;"
+      echo "                   pane, then window, then global option; default chrome)"
+      echo "  browser         Print where open sends a URL here: tweb, tweb-chrome, tweb-webkit or chrome"
       echo "  add <url>       Add URL to current window's tab group"
       echo "  move            Move Chrome's active tab to current window's group"
       echo "  remove          Remove Chrome's active tab from its group"
