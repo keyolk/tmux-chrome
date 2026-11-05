@@ -730,27 +730,46 @@ function browser_target {
   esac
 }
 
-# The TWeb pane in the caller's tmux window running the given engine (TWeb
-# reports `chrome` for the CDP engine, `electron` otherwise), or an empty string
-# when there is none. A pane on the other engine does not count: a URL meant
-# for managed Chrome must not land in Electron, where device trust fails.
-#
-# Window id rather than session plus name: it is unique per tmux server, so one
-# comparison settles it, and it survives a window being renamed underneath us.
+# The TWeb pane in the caller's tmux window to open a page in, or an empty
+# string when there is none. Any pane there will do: a tab can run on another
+# engine than its pane (`tweb tab engine`), so the engine picks only which pane
+# comes first: one whose active tab runs it, then one with any tab on it, then
+# the first. A pane's own engine (`status.browser`) is only what its first tab
+# started on: a pane of chrome tabs reports electron, and matching on it made a
+# new pane for every claude.ai link beside one already showing claude.ai.
 function tweb_pane_in_current_window {
-  local engine="$1" pane browser current
+  local engine="$1" pane current
   current=$(tmux display-message "${TMUX_PANE_TFLAG[@]}" -p '#{window_id}' 2>/dev/null)
   [[ -z "$current" ]] && return 0
 
-  while IFS=$'\t' read -r pane browser; do
+  while IFS=$'\t' read -r _ pane; do
     [[ -z "$pane" ]] && continue
-    [[ "${browser:-electron}" == "$engine" ]] || continue
     # A pane TWeb still lists can be gone from tmux — the engine outlives its pane
     # briefly on exit — so this doubles as the liveness check.
     [[ "$(tmux display-message -t "$pane" -p '#{window_id}' 2>/dev/null)" == "$current" ]] || continue
     printf '%s\n' "$pane"
     return 0
-  done < <(tweb panes --json 2>/dev/null | jq -r '.[] | select(.pane) | [.pane, (.status.browser // "electron")] | @tsv' 2>/dev/null)
+  done < <(tweb panes --json 2>/dev/null | jq -r --arg e "$engine" '
+    [.[] | select(.pane)
+      | (.status.tabs.tabs // []) as $t
+      | { pane, rank: (if any($t[]; .active and .engine == $e) then 0
+                       elif any($t[]; .engine == $e) or ((.status.browser // "electron") == $e) then 1
+                       else 2 end) }]
+    | sort_by(.rank) | .[] | [.rank, .pane] | @tsv' 2>/dev/null)
+}
+
+# A new tab in `pane` showing `url` on `engine`. A new tab takes the engine of
+# the tab that was active, so one on another engine is moved before the page
+# loads: a URL meant for managed Chrome must not load in Electron, where device
+# trust fails.
+function tweb_tab_on_engine {
+  local pane="$1" engine="$2" url="$3" got
+  got=$(tweb tab new --pane "$pane" --json about:blank 2>/dev/null | jq -r '.tabs[] | select(.active) | .engine' 2>/dev/null) || return 1
+  if [[ "$got" != "$engine" ]]; then
+    tweb tab engine "$engine" --pane "$pane" >/dev/null 2>&1 || return 1
+  fi
+  # A page that will not load still shows its error in that tab, as in Chrome.
+  tweb navigate --pane "$pane" "$url" >/dev/null 2>&1 || true
 }
 
 # Hands the URL to TWeb when the target is a TWeb one (tweb, tweb-chrome, tweb-webkit). Returns non-zero
@@ -769,8 +788,8 @@ function try_tweb_open {
 
   pane=$(tweb_pane_in_current_window "$engine")
   if [[ -n "$pane" ]]; then
-    tweb tab new --pane "$pane" "$url" >/dev/null 2>&1 || return 1
-    echo "Opened in TWeb ($engine) pane $pane: $url"
+    tweb_tab_on_engine "$pane" "$engine" "$url" || return 1
+    echo "Opened in TWeb pane $pane ($engine tab): $url"
     return 0
   fi
 
