@@ -1,146 +1,107 @@
+// URL and title rules are tested with the rules themselves, in
+// extension/stale.test.js. This file covers what Raycast still decides.
 import { describe, expect, test } from "bun:test";
-import { Tab } from "./bridge";
 import {
-  classifyTerminalPage,
-  parsePullRequestUrl,
+  BridgeCandidate,
+  BridgePullRequest,
+  fromBridge,
   selectUnattendedClose,
+  verifyPullRequests,
 } from "./stale-tabs";
 
-function tab(url: string, title = "Example"): Tab {
+function blank(overrides: Partial<BridgeCandidate>): BridgeCandidate {
   return {
     id: 1,
-    title,
-    url,
+    title: "New Tab",
+    url: "chrome://newtab/",
     group_id: 2,
     group_title: "test",
+    kind: "blank-tab",
+    reason: "Empty new tab",
+    verified: true,
+    safe_for_bulk_close: true,
+    display_title: "New Tab",
+    display_url: "chrome://newtab/",
+    ...overrides,
   };
 }
 
-describe("parsePullRequestUrl", () => {
-  test("parses PR URLs and subpages", () => {
-    expect(
-      parsePullRequestUrl(
-        "https://github.com/sendbird/ops-k8s/pull/9413/files",
-      ),
-    ).toEqual({ owner: "sendbird", repo: "ops-k8s", number: 9413 });
-  });
+function pr(id: number, number: number): BridgePullRequest {
+  return {
+    id,
+    title: `PR ${number}`,
+    url: `https://github.com/o/r/pull/${number}`,
+    group_id: 2,
+    group_title: "test",
+    owner: "o",
+    repo: "r",
+    number,
+  };
+}
 
-  test("rejects lists, malformed paths, and other hosts", () => {
-    expect(
-      parsePullRequestUrl("https://github.com/sendbird/ops-k8s/pulls"),
-    ).toBeNull();
-    expect(
-      parsePullRequestUrl("https://github.com/sendbird/ops-k8s/pull/nope"),
-    ).toBeNull();
-    expect(parsePullRequestUrl("https://example.com/a/b/pull/1")).toBeNull();
+describe("fromBridge", () => {
+  test("maps the wire names to the Raycast names", () => {
+    const c = fromBridge(blank({ display_title: "shown" }));
+    expect(c.safeForBulkClose).toBe(true);
+    expect(c.displayTitle).toBe("shown");
+    expect(c.displayUrl).toBe("chrome://newtab/");
   });
 });
 
-describe("classifyTerminalPage", () => {
-  test("classifies exact MCP completion URL", () => {
-    const result = classifyTerminalPage(
-      tab("https://claude.ai/settings/mcp/auth_done?authed_mcp_server_id=abc"),
+describe("verifyPullRequests", () => {
+  test("keeps only PRs the API reports as ended", async () => {
+    const scan = await verifyPullRequests(
+      {
+        candidates: [blank({ id: 9 })],
+        pull_requests: [pr(1, 10), pr(2, 11), pr(3, 12)],
+      },
+      async () =>
+        new Map([
+          ["o/r#10", { state: "MERGED", merged: true }],
+          ["o/r#11", { state: "OPEN", merged: false }],
+          ["o/r#12", { state: "CLOSED", merged: false }],
+        ]),
     );
-    expect(result?.kind).toBe("oauth-complete");
-    expect(result?.safeForBulkClose).toBe(true);
+    expect(scan.candidates.map((c) => [c.id, c.kind])).toEqual([
+      [9, "blank-tab"],
+      [1, "github-pr-merged"],
+      [3, "github-pr-closed"],
+    ]);
+    expect(scan.githubError).toBeUndefined();
   });
 
-  test("redacts OAuth callback credentials from title and URL", () => {
-    const result = classifyTerminalPage(
-      tab(
-        "http://127.0.0.1:51200/callback?code=secret&state=csrf",
-        "127.0.0.1:51200/callback?code=secret&state=csrf",
-      ),
+  test("a failed lookup keeps every PR open and reports why", async () => {
+    const scan = await verifyPullRequests(
+      { candidates: [], pull_requests: [pr(1, 10)] },
+      async () => {
+        throw new Error("gh: not logged in");
+      },
     );
-    expect(result?.displayTitle).toBe("127.0.0.1:51200/callback");
-    expect(result?.displayUrl).toBe("http://127.0.0.1:51200/callback");
-  });
-
-  test("classifies callback errors", () => {
-    const result = classifyTerminalPage(
-      tab("http://localhost:3000/oauth/callback?error=access_denied"),
-    );
-    expect(result?.kind).toBe("oauth-error");
-    expect(result?.safeForBulkClose).toBe(false);
-  });
-
-  test("closes the Okta dashboard left after SSO", () => {
-    const result = classifyTerminalPage(
-      tab("https://sendbird.okta.com/app/UserHome?session_hint=AUTHENTICATED"),
-    );
-    expect(result?.kind).toBe("oauth-complete");
-    expect(result?.safeForBulkClose).toBe(true);
-  });
-
-  test("classifies AWS SSO device authorization and Twingate auth", () => {
-    expect(
-      classifyTerminalPage(
-        tab(
-          "https://d-123.awsapps.com/start/#/?clientId=abc&clientType=cHVibGlj&deviceContextId=x",
-        ),
-      )?.kind,
-    ).toBe("oauth-complete");
-    expect(
-      classifyTerminalPage(
-        tab("https://sendbird.us1.twingate.com/client-auth-status"),
-      )?.kind,
-    ).toBe("oauth-complete");
-  });
-
-  test("classifies Slack desktop handoff interstitials", () => {
-    const result = classifyTerminalPage(
-      tab(
-        "https://sendbird.slack.com/archives/C1/p123",
-        "Redirecting… | Slack",
-      ),
-    );
-    expect(result?.kind).toBe("app-handoff");
-    expect(result?.safeForBulkClose).toBe(true);
-    expect(
-      classifyTerminalPage(
-        tab("https://sendbird.slack.com/archives/C1/p123", "general | Slack"),
-      ),
-    ).toBeNull();
-  });
-
-  test("classifies empty new tabs", () => {
-    expect(classifyTerminalPage(tab("chrome://newtab/"))?.kind).toBe(
-      "blank-tab",
-    );
-    expect(classifyTerminalPage(tab("about:blank"))?.kind).toBe("blank-tab");
-  });
-
-  test("does not classify login and AWS portal pages", () => {
-    expect(
-      classifyTerminalPage(tab("https://sendbird.okta.com/login/login.htm")),
-    ).toBeNull();
-    expect(
-      classifyTerminalPage(tab("https://example.awsapps.com/start/#/")),
-    ).toBeNull();
+    expect(scan.candidates).toEqual([]);
+    expect(scan.githubError).toBe("gh: not logged in");
   });
 });
 
 describe("selectUnattendedClose", () => {
   const now = 10 * 60_000;
-  function blank(overrides: Partial<Tab>) {
-    const result = classifyTerminalPage({ ...tab("chrome://newtab/"), ...overrides });
-    if (!result) throw new Error("expected a candidate");
-    return result;
-  }
 
   test("closes only idle, unprotected, bulk-safe tabs", () => {
-    const idle = blank({ id: 1, last_accessed: 0 });
-    const recent = blank({ id: 2, last_accessed: now - 60_000 });
-    const unknown = blank({ id: 3 });
-    const active = blank({ id: 4, last_accessed: 0, active: true });
-    const pinned = blank({ id: 5, last_accessed: 0, pinned: true });
-    const okta = classifyTerminalPage({
-      ...tab("http://localhost:3000/oauth/callback?error=denied"),
-      last_accessed: 0,
-    });
+    const idle = fromBridge(blank({ id: 1, last_accessed: 0 }));
+    const recent = fromBridge(blank({ id: 2, last_accessed: now - 60_000 }));
+    const unknown = fromBridge(blank({ id: 3 }));
+    const active = fromBridge(blank({ id: 4, last_accessed: 0, active: true }));
+    const pinned = fromBridge(blank({ id: 5, last_accessed: 0, pinned: true }));
+    const failed = fromBridge(
+      blank({
+        id: 6,
+        last_accessed: 0,
+        kind: "oauth-error",
+        safe_for_bulk_close: false,
+      }),
+    );
     expect(
       selectUnattendedClose(
-        [idle, recent, unknown, active, pinned, okta!],
+        [idle, recent, unknown, active, pinned, failed],
         5 * 60_000,
         now,
       ).map((candidate) => candidate.id),

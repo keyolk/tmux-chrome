@@ -1,5 +1,5 @@
 import { Alert, confirmAlert, showHUD, showToast, Toast } from "@raycast/api";
-import { closeTabs, getCleanupTabs } from "./bridge";
+import { closeTabs } from "./bridge";
 import { CleanupCandidate, findCleanupCandidates } from "./stale-tabs";
 
 function isProtected(candidate: CleanupCandidate): boolean {
@@ -13,7 +13,7 @@ function closable(candidates: CleanupCandidate[]): CleanupCandidate[] {
 }
 
 export default async function CleanStaleTabs() {
-  const initial = await findCleanupCandidates(await getCleanupTabs());
+  const initial = await findCleanupCandidates();
   const candidates = closable(initial.candidates);
   if (candidates.length === 0) {
     await showHUD(
@@ -61,7 +61,7 @@ export default async function CleanStaleTabs() {
     return;
   }
 
-  const fresh = await findCleanupCandidates(await getCleanupTabs());
+  const fresh = await findCleanupCandidates();
   const freshById = new Map(
     closable(fresh.candidates).map((candidate) => [candidate.id, candidate]),
   );

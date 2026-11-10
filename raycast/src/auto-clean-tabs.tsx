@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { getPreferenceValues } from "@raycast/api";
-import { cleanTabs, closeTabs, getCleanupTabs } from "./bridge";
+import { cleanTabs, closeTabs } from "./bridge";
 import { findCleanupCandidates, selectUnattendedClose } from "./stale-tabs";
 
 const execFileAsync = promisify(execFile);
@@ -46,7 +46,7 @@ export default async function AutoCleanTabs() {
   const minIdleMs = idleMs();
 
   try {
-    const scan = await findCleanupCandidates(await getCleanupTabs());
+    const scan = await findCleanupCandidates();
     const targets = selectUnattendedClose(
       scan.candidates,
       minIdleMs,

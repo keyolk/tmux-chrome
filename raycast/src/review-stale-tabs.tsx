@@ -11,7 +11,7 @@ import {
   showToast,
   Toast,
 } from "@raycast/api";
-import { closeTabs, focusTab, getCleanupTabs, raiseTabWindow } from "./bridge";
+import { closeTabs, focusTab, raiseTabWindow } from "./bridge";
 import { CleanupCandidate, findCleanupCandidates } from "./stale-tabs";
 
 function kindLabel(candidate: CleanupCandidate): string {
@@ -71,8 +71,7 @@ export default function ReviewStaleTabs() {
     setGithubError(null);
     setError(null);
     try {
-      const tabs = await getCleanupTabs();
-      const scan = await findCleanupCandidates(tabs);
+      const scan = await findCleanupCandidates();
       setCandidates(scan.candidates);
       setGithubError(scan.githubError ?? null);
     } catch (loadError) {
@@ -89,7 +88,7 @@ export default function ReviewStaleTabs() {
   async function revalidate(
     selected: CleanupCandidate[],
   ): Promise<CleanupCandidate[]> {
-    const fresh = await findCleanupCandidates(await getCleanupTabs());
+    const fresh = await findCleanupCandidates();
     return selected.filter((candidate) =>
       fresh.candidates.some(
         (current) =>
