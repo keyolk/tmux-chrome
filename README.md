@@ -20,6 +20,7 @@ Each tmux window name maps to a Chrome tab group title. When you switch windows,
 | CLI | `bin/tmux-chrome` | Terminal interface, tmux pane URL grabbing |
 | Chrome extension | `extension/` | Tab group control via `chrome.tabGroups` API |
 | Native messaging host | `host/bridge.py` | Unix socket ↔ Chrome native messaging bridge |
+| Terminal UI | `tui/` (`bin/tmux-chrome-tui`) | Full-screen fuzzy search and CRUD over groups and tabs |
 | Raycast extension | `raycast/` | GUI tab group switching and tab browsing |
 
 ## Install
@@ -31,7 +32,7 @@ make install
 ./install.sh
 ```
 
-`make install` symlinks `tmux-chrome` to `~/.local/bin/`.
+`make install` symlinks `tmux-chrome` to `~/.local/bin/` and builds the terminal UI into `bin/tmux-chrome-tui` (needs Go). `make test` runs the Go, bridge, extension and Raycast tests.
 
 `install.sh` walks you through:
 1. Loading the Chrome extension (Developer mode → Load unpacked)
@@ -93,6 +94,7 @@ tmux-chrome grab                 # Extract URLs from tmux panes → fzf multi-se
 tmux-chrome tabs                 # Browse current group's tabs via fzf → focus selected
 tmux-chrome tabs --all           # Browse all tabs across all groups
 tmux-chrome picker               # Unified picker for apps + layouts + current group's tabs
+tmux-chrome tui [--popup]        # Full-screen UI over groups and tabs (see "Terminal UI")
 
 # Window workspace layouts
 # Default config: ~/.config/tmux-chrome/window-layouts.json
@@ -101,6 +103,59 @@ tmux-chrome window-layout list
 tmux-chrome window-layout apply chrome-terminal
 tmux-chrome window-layout edit
 ```
+
+### Terminal UI
+
+```bash
+tmux-chrome tui            # full screen in this pane
+tmux-chrome tui --popup    # in a tmux popup; closes after you jump somewhere
+```
+
+Bind it to a key, e.g. `bind-key C run-shell -b "tmux-chrome tui --popup"`.
+
+Groups are on the left, the selected group's tabs on the right. `◆` marks the
+group bound to the tmux window you opened the UI from, `●` a group expanded in
+Chrome, `!` an orphan group (no tmux window), and `(그룹 없음)` the loose tabs.
+
+**Search** (`/`): words are fuzzy and must all match title, URL or group;
+`@word` matches the group title, `/word` a part of the URL, `!word` excludes.
+`tab` cycles the scope (groups + tabs / tabs / groups). With a query, the tab
+pane lists matches across every group.
+
+| Key | Groups pane | Tabs pane |
+|---|---|---|
+| `enter` | switch to the group (its tmux window when bound) | focus the tab, terminal keeps focus |
+| `space` / `*` / `esc` | select / select all visible / clear selection, then query | same |
+| `n` | new group (the selected tabs, else an empty one) | same |
+| `r` / `c` / `b` | rename (renames the bound tmux window too) / color / bind this tmux window | — |
+| `M` | merge into another group | — |
+| `d` / `D` | ungroup, tabs stay / close the group and its tabs | — |
+| `m` / `u` | — | move to a group (or a new one) / take out of its group |
+| `x` / `p` / `R` / `y` | — | close / pin / reload / copy URL |
+| `o` / `g` | open a URL here / open URLs found in this window's panes | same |
+| `U` | reopen the tabs closed last, into their old groups | |
+| `C` | cleanup checklist: stale tabs, loose-tab sweep, orphan groups | |
+| `:` / `?` | command palette (also layouts, swap, merge, focus apps) / help | |
+
+Selections apply to every key that acts on tabs or groups. Closing more than
+one tab, and every group-level destructive action, asks first and lists the
+targets; targets are looked up again by id when you confirm, so a tab that
+closed in the meantime is not touched. Before any close, the UI writes a
+snapshot to `~/.local/state/tmux-chrome/` (readable by `tmux-chrome restore`).
+
+**When the bridge drops** the UI keeps the last data on screen and stays
+searchable; the header says how old it is. Keys that change Chrome are held
+back. It reconnects on its own (0.5s → 5s), and after 3s it wakes the
+extension through the same lock the tmux hooks use, rather than waiting out
+the extension's own backoff of up to 5 minutes. If Chrome is not running it
+stops retrying and `enter` launches Chrome in the background. A write whose
+reply was lost is never sent again: after reconnecting the UI checks the new
+snapshot and says whether it landed. `ctrl+r` reconnects now, or reloads an
+extension too old for this UI.
+
+Stale-tab rules live in `extension/stale.js`, shared by this UI and Raycast;
+ended PRs are verified through `gh` by each client. Logs go to
+`~/.local/state/tmux-chrome/tui.log`.
 
 ### Opening into TWeb instead of Chrome
 
@@ -218,6 +273,7 @@ tmux-chrome restore --reopen-missing # also reopen tabs that were since closed
 - Chrome with Developer mode enabled
 - tmux
 - jq, fzf (for CLI interactive features)
+- Go 1.25+ (to build the terminal UI); `gh` (optional, to verify ended PRs during cleanup)
 - Node.js + bun (for Raycast extension, optional)
 
 ## Uninstall

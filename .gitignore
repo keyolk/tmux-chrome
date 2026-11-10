@@ -3,3 +3,4 @@ raycast/.eslintrc.json
 *.bun
 __pycache__/
 *.pyc
+bin/tmux-chrome-tui

@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { Tab } from "./bridge";
+import { bridgeRequest, Tab } from "./bridge";
 
 const execFileAsync = promisify(execFile);
 const GH_BIN = process.env.GH_BIN ?? "/opt/homebrew/bin/gh";
@@ -34,177 +34,38 @@ interface PullRequestState {
   merged: boolean;
 }
 
-export function parsePullRequestUrl(rawUrl: string): PullRequestRef | null {
-  let url: URL;
-  try {
-    url = new URL(rawUrl);
-  } catch {
-    return null;
-  }
-  if (url.hostname !== "github.com") return null;
-
-  const match = url.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:\/|$)/);
-  if (!match) return null;
-  return { owner: match[1], repo: match[2], number: Number(match[3]) };
+// The extension's stale.js owns the URL and title rules, so Raycast and the
+// terminal UI cannot disagree on what is stale. Its answer is snake_case;
+// these are the wire shapes.
+export interface BridgeCandidate extends Tab {
+  kind: CandidateKind;
+  reason: string;
+  verified: boolean;
+  safe_for_bulk_close: boolean;
+  display_title: string;
+  display_url: string;
 }
 
-export function classifyTerminalPage(tab: Tab): CleanupCandidate | null {
-  let url: URL;
-  try {
-    url = new URL(tab.url);
-  } catch {
-    return null;
-  }
+export interface BridgePullRequest extends Tab, PullRequestRef {}
 
-  if (
-    url.hostname === "claude.ai" &&
-    url.pathname === "/settings/mcp/auth_done"
-  ) {
-    return candidate(
-      tab,
-      "oauth-complete",
-      "MCP authentication completed",
-      true,
-    );
-  }
-
-  if (
-    (url.hostname === "127.0.0.1" || url.hostname === "localhost") &&
-    /(^|\/)callback\/?$/.test(url.pathname) &&
-    (url.searchParams.has("code") || url.searchParams.has("error"))
-  ) {
-    const failed = url.searchParams.has("error");
-    return candidate(
-      tab,
-      failed ? "oauth-error" : "oauth-complete",
-      failed ? "OAuth callback returned an error" : "OAuth callback completed",
-      !failed,
-    );
-  }
-
-  // Okta lands here after an SP-initiated SSO finishes; the user never opens
-  // the dashboard on purpose, so the tab is leftover from a login.
-  if (
-    url.hostname === "sendbird.okta.com" &&
-    url.pathname === "/app/UserHome" &&
-    url.searchParams.get("session_hint") === "AUTHENTICATED"
-  ) {
-    return candidate(
-      tab,
-      "oauth-complete",
-      "Okta returned to the authenticated app dashboard",
-      true,
-    );
-  }
-
-  // `aws sso login` opens the portal with the device-flow client in the hash.
-  // A plain portal visit has no clientId, so it stays out of cleanup.
-  if (
-    url.hostname.endsWith(".awsapps.com") &&
-    url.pathname === "/start/" &&
-    new URLSearchParams(url.hash.replace(/^#\/?\??/, "")).has("clientId")
-  ) {
-    return candidate(
-      tab,
-      "oauth-complete",
-      "AWS SSO device authorization page",
-      true,
-    );
-  }
-
-  if (
-    url.hostname.endsWith(".twingate.com") &&
-    url.pathname === "/client-auth-status"
-  ) {
-    return candidate(
-      tab,
-      "oauth-complete",
-      "Twingate client authentication finished",
-      true,
-    );
-  }
-
-  // Slack permalinks hand off to the desktop app and leave this interstitial.
-  if (
-    url.hostname.endsWith(".slack.com") &&
-    tab.title.startsWith("Redirecting")
-  ) {
-    return candidate(
-      tab,
-      "app-handoff",
-      "Slack opened the link in the desktop app",
-      true,
-    );
-  }
-
-  if (
-    tab.url === "chrome://newtab/" ||
-    tab.url === "about:blank" ||
-    url.hostname === "newtab"
-  ) {
-    return candidate(tab, "blank-tab", "Empty new tab", true);
-  }
-
-  if (
-    url.hostname === "github.com" &&
-    tab.title === "Page not found · GitHub"
-  ) {
-    return candidate(
-      tab,
-      "page-error",
-      "GitHub reports that the page does not exist",
-      false,
-    );
-  }
-
-  return null;
+export interface BridgeStaleScan {
+  candidates: BridgeCandidate[];
+  pull_requests: BridgePullRequest[];
 }
 
-function candidate(
-  tab: Tab,
-  kind: CandidateKind,
-  reason: string,
-  safeForBulkClose: boolean,
-): CleanupCandidate {
+export function fromBridge(c: BridgeCandidate): CleanupCandidate {
+  const {
+    safe_for_bulk_close,
+    display_title,
+    display_url,
+    ...rest
+  } = c;
   return {
-    ...tab,
-    kind,
-    reason,
-    verified: true,
-    safeForBulkClose,
-    displayTitle: redactTitle(tab),
-    displayUrl: redactUrl(tab.url),
+    ...rest,
+    safeForBulkClose: safe_for_bulk_close,
+    displayTitle: display_title,
+    displayUrl: display_url,
   };
-}
-
-function redactTitle(tab: Tab): string {
-  try {
-    const url = new URL(tab.url);
-    if (
-      (url.hostname === "127.0.0.1" || url.hostname === "localhost") &&
-      /(^|\/)callback\/?$/.test(url.pathname)
-    ) {
-      return `${url.host}${url.pathname}`;
-    }
-  } catch {
-    // Keep the original title for malformed URLs.
-  }
-  return tab.title;
-}
-
-function redactUrl(rawUrl: string): string {
-  try {
-    const url = new URL(rawUrl);
-    if (
-      (url.hostname === "127.0.0.1" || url.hostname === "localhost") &&
-      /(^|\/)callback\/?$/.test(url.pathname)
-    ) {
-      return `${url.origin}${url.pathname}`;
-    }
-    return rawUrl;
-  } catch {
-    return rawUrl;
-  }
 }
 
 function pullRequestKey(ref: PullRequestRef): string {
@@ -215,7 +76,7 @@ function graphqlString(value: string): string {
   return JSON.stringify(value);
 }
 
-async function getPullRequestStates(
+export async function getPullRequestStates(
   refs: PullRequestRef[],
 ): Promise<Map<string, PullRequestState>> {
   const unique = [
@@ -252,31 +113,33 @@ export interface CleanupScan {
   githubError?: string;
 }
 
-export async function findCleanupCandidates(tabs: Tab[]): Promise<CleanupScan> {
-  const refs = tabs
-    .map((tab) => parsePullRequestUrl(tab.url))
-    .filter((ref): ref is PullRequestRef => ref !== null);
+export async function findCleanupCandidates(): Promise<CleanupScan> {
+  const scan = await bridgeRequest<BridgeStaleScan>({
+    type: "stale_candidates",
+  });
+  return verifyPullRequests(scan);
+}
+
+// verifyPullRequests turns the extension's scan into candidates: terminal
+// pages as judged, and PR tabs only once the GitHub API says the PR ended.
+export async function verifyPullRequests(
+  scan: BridgeStaleScan,
+  lookup: typeof getPullRequestStates = getPullRequestStates,
+): Promise<CleanupScan> {
   let states = new Map<string, PullRequestState>();
   let githubError: string | undefined;
   try {
-    states = await getPullRequestStates(refs);
+    states = await lookup(scan.pull_requests);
   } catch (error) {
     githubError = error instanceof Error ? error.message : String(error);
   }
-  const candidates: CleanupCandidate[] = [];
+  const candidates = scan.candidates.map(fromBridge);
 
-  for (const tab of tabs) {
-    const terminal = classifyTerminalPage(tab);
-    if (terminal) {
-      candidates.push(terminal);
-      continue;
-    }
-
-    const ref = parsePullRequestUrl(tab.url);
-    if (!ref) continue;
-    const state = states.get(pullRequestKey(ref));
+  for (const pr of scan.pull_requests) {
+    const state = states.get(pullRequestKey(pr));
     if (!state || state.state === "OPEN") continue;
     const merged = state.merged || state.state === "MERGED";
+    const { owner: _owner, repo: _repo, number: _number, ...tab } = pr;
     candidates.push({
       ...tab,
       kind: merged ? "github-pr-merged" : "github-pr-closed",

@@ -1452,6 +1452,46 @@ function cmd_rebind_current_window {
   echo "Rebound tmux window '$group_name' to Chrome group '${resolved_title:-$group_name}' (group_id=$group_id, source=$source)"
 }
 
+function tui_binary {
+  # The Go UI lives next to this script's real path (make install symlinks
+  # this file into ~/.local/bin; the binary is built into bin/ beside it).
+  local self dir
+  self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+  dir="$(cd "$(dirname "$self")" && pwd)"
+  if [[ -x "$dir/tmux-chrome-tui" ]]; then
+    echo "$dir/tmux-chrome-tui"
+  elif command -v tmux-chrome-tui >/dev/null 2>&1; then
+    command -v tmux-chrome-tui
+  else
+    return 1
+  fi
+}
+
+function cmd_tui {
+  local bin popup=0
+  bin=$(tui_binary) || {
+    echo "Error: tmux-chrome-tui not built; run 'make tui' in the repo" >&2
+    return 1
+  }
+  [[ "${1:-}" == "--popup" ]] && popup=1
+
+  # The UI talks to the bridge itself and revives it when it is down, so it
+  # deliberately does not go through bridge_ready here.
+  local window=""
+  if [[ -n "${TMUX:-}" ]]; then
+    window=$(tmux display-message "${TMUX_PANE_TFLAG[@]}" -p '#{window_id}' 2>/dev/null || true)
+  fi
+  local -a args=(--cli "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")
+  [[ -n "$window" ]] && args+=(--window "$window")
+
+  if (( popup )) && [[ -n "${TMUX:-}" ]]; then
+    # A popup closes when the UI exits, so --popup also quits after a jump.
+    tmux display-popup -E -w 90% -h 85% "${bin@Q} --popup ${args[*]@Q}"
+    return
+  fi
+  exec "$bin" "${args[@]}"
+}
+
 function cmd_picker {
   # Unified fzf picker: apps + saved layouts + window actions + current window's tabs
   local apps="app\t[app] Chrome\napp\t[app] Slack\napp\t[app] Zoom\napp\t[app] Discord"
@@ -2254,12 +2294,13 @@ function main {
     rebind-current-window) cmd_rebind_current_window ;;
     rebind-all) cmd_rebind_all "$@" ;;
     picker)  cmd_picker ;;
+    tui)     cmd_tui "$@" ;;
     browser) browser_target ;;
     swap-window) cmd_swap_window ;;
     window-layout) cmd_window_layout "$@" ;;
     distribute|distribute-windows) cmd_distribute_windows ;;
     *)
-      echo "Usage: tmux-chrome {switch|list|delete|open|browser|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|snapshot|restore|merge|cycle-tab|rebind-current-window|rebind-all|picker|swap-window|window-layout|distribute}"
+      echo "Usage: tmux-chrome {switch|tui|list|delete|open|browser|add|move|remove|export-group|import-group|clear-group|grab|tabs|rename|reload|focus|clean|sync|snapshot|restore|merge|cycle-tab|rebind-current-window|rebind-all|picker|swap-window|window-layout|distribute}"
       echo ""
       echo "  switch          Switch to tab group matching current tmux window"
       echo "  rename          Rename tab group to match current tmux window name"
@@ -2279,6 +2320,7 @@ function main {
       echo "  clear-group     Delete one named tab group"
       echo "  grab            Extract URLs from panes → fzf → add to tab group"
       echo "  tabs [--all]    Browse tabs in group via fzf → focus selected"
+      echo "  tui [--popup]   Full-screen UI: fuzzy search + CRUD over groups and tabs (--popup: tmux popup)"
       echo "  reload          Restart Chrome extension and reconnect bridge"
       echo "  clean           Move all tabs not in any tab group into a reserved native group"
       echo "  sync [--force|--force-all] [--quiet]  Report tab groups with no matching tmux window (report-only by default; --force ungroups them, --force-all lifts the bulk cap, --quiet suppresses no-op output for hook use)"

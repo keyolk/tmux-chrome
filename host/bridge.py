@@ -8,6 +8,11 @@ Background thread: Unix socket server that accepts commands from tmux.sh.
 Protocol:
 - Chrome native messaging: 4-byte little-endian length prefix + JSON on stdin/stdout.
 - Unix socket: newline-delimited JSON. Client sends request, reads response, disconnects.
+  Exception: a {"type": "subscribe"} request keeps the connection open. The
+  bridge answers {"event": "subscribed"} and then writes every event the
+  extension raises (messages with "event" and no "id"), plus a
+  {"event": "ping"} every PING_INTERVAL seconds so the client can tell a
+  silent bridge from a dead one.
 """
 
 import json
@@ -16,8 +21,13 @@ import socket
 import struct
 import sys
 import threading
+import time
 
 SOCKET_PATH = "/tmp/tmux-chrome-bridge.sock"
+PING_INTERVAL = 15.0
+# A subscriber that cannot take a line within this long is dropped: the main
+# thread broadcasts, and one stuck client must not stall Chrome's replies.
+SUBSCRIBER_SEND_TIMEOUT = 2.0
 
 
 def _strip_surrogates(value):
@@ -94,10 +104,75 @@ def send_and_wait(msg, timeout=5.0):
     return {"id": request_id, "success": False, "error": "Timeout waiting for Chrome response"}
 
 
+# Subscribed client connections -> a lock that serialises writes to each.
+_subscribers = {}
+_subscribers_lock = threading.Lock()
+
+
+def _send_line(conn, lock, msg):
+    data = (_safe_dumps(msg) + "\n").encode("utf-8")
+    with lock:
+        conn.sendall(data)
+
+
+def _drop_subscriber(conn):
+    with _subscribers_lock:
+        _subscribers.pop(conn, None)
+    try:
+        conn.close()
+    except OSError:
+        pass
+
+
+def broadcast(msg):
+    """Write an extension event to every subscriber, dropping the ones that fail."""
+    with _subscribers_lock:
+        targets = list(_subscribers.items())
+    for conn, lock in targets:
+        try:
+            _send_line(conn, lock, msg)
+        except OSError:
+            _drop_subscriber(conn)
+
+
+def serve_subscriber(conn):
+    """Hold a subscription open until the client goes away.
+
+    recv doubles as the ping timer: it times out every PING_INTERVAL, and an
+    empty read means the client closed its end.
+    """
+    lock = threading.Lock()
+    conn.settimeout(SUBSCRIBER_SEND_TIMEOUT)
+    try:
+        _send_line(conn, lock, {"event": "subscribed", "host_pid": os.getpid()})
+    except OSError:
+        conn.close()
+        return
+    with _subscribers_lock:
+        _subscribers[conn] = lock
+    try:
+        while True:
+            conn.settimeout(PING_INTERVAL)
+            try:
+                if not conn.recv(4096):
+                    break
+                continue
+            except socket.timeout:
+                pass
+            conn.settimeout(SUBSCRIBER_SEND_TIMEOUT)
+            _send_line(conn, lock, {"event": "ping", "at": time.time()})
+    except OSError:
+        pass
+    finally:
+        _drop_subscriber(conn)
+
+
 def handle_chrome_response(msg):
     """Handle a response from Chrome extension."""
     request_id = msg.get("id")
     if not request_id:
+        if msg.get("event"):
+            broadcast(msg)
         return
 
     with _pending_lock:
@@ -148,6 +223,10 @@ def handle_client(conn):
 
         msg = json.loads(line)
 
+        if msg.get("type") == "subscribe":
+            serve_subscriber(conn)
+            return
+
         # Forward to Chrome and wait for response
         response = send_and_wait(msg)
 
@@ -162,6 +241,7 @@ def handle_client(conn):
         except Exception:
             pass
     finally:
+        # serve_subscriber has already closed its connection; closing twice is harmless.
         conn.close()
 
 

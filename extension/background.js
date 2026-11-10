@@ -2,7 +2,10 @@
 // Communicates with native messaging host to sync tab groups with tmux windows.
 // RULE: Never call chrome.windows.update({focused: true}) — terminal must keep focus.
 
-const BUILD_MARKER = "tmux-chrome-bridge:regroup-restore-2026-05-29";
+const BUILD_MARKER = "tmux-chrome-bridge:tui-2026-11-10";
+
+// Stale-tab rules shared with every client; see stale.js.
+importScripts("stale.js");
 console.log("[tmux-chrome] background loaded:", BUILD_MARKER);
 
 const NATIVE_HOST = "com.tmux.chrome.bridge";
@@ -21,6 +24,23 @@ const pendingCloseTabIds = new Set();
 const protectedDuringClose = new Set();
 
 let mutationQueue = Promise.resolve();
+
+// Change feed for subscribed clients (the terminal UI). A change only says
+// "something moved": clients refetch a snapshot rather than patch their copy,
+// so a lost or reordered event can never leave them with a wrong picture.
+// EPOCH changes on every service worker start, so a client can tell a seq
+// that went backwards because the worker restarted from one it already saw.
+const EPOCH = String(Date.now());
+let changeSeq = 0;
+
+function notifyChange(kind) {
+  changeSeq += 1;
+  sendToHost({ event: "changed", kind, seq: changeSeq, epoch: EPOCH });
+}
+
+// onUpdated fires for every loading step and favicon; only these change what
+// a client shows.
+const VISIBLE_TAB_FIELDS = ["title", "url", "groupId", "pinned", "audible"];
 
 function runSerialized(fn) {
   const task = mutationQueue.then(fn, fn);
@@ -65,6 +85,19 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     }
   }
 });
+
+chrome.tabs.onCreated.addListener(() => notifyChange("tab.created"));
+chrome.tabs.onRemoved.addListener(() => notifyChange("tab.removed"));
+chrome.tabs.onMoved.addListener(() => notifyChange("tab.moved"));
+chrome.tabs.onAttached.addListener(() => notifyChange("tab.attached"));
+chrome.tabs.onActivated.addListener(() => notifyChange("tab.activated"));
+chrome.tabs.onUpdated.addListener((_tabId, changeInfo) => {
+  if (VISIBLE_TAB_FIELDS.some((field) => field in changeInfo)) notifyChange("tab.updated");
+});
+chrome.tabGroups.onCreated.addListener(() => notifyChange("group.created"));
+chrome.tabGroups.onUpdated.addListener(() => notifyChange("group.updated"));
+chrome.tabGroups.onRemoved.addListener(() => notifyChange("group.removed"));
+chrome.tabGroups.onMoved.addListener(() => notifyChange("group.moved"));
 
 function connect() {
   // Prevent multiple simultaneous connections
@@ -156,7 +189,7 @@ async function handleMessage(msg) {
     case "focus_tab":
       return focusTab(msg.tab_id);
     case "close_tabs":
-      return runSerialized(() => closeTabs(msg.tabs));
+      return runSerialized(() => closeTabs(msg.tabs, msg.force === true));
     case "raise_group_window":
       return raiseGroupWindow(msg.name, msg.group_id, msg.locator);
     case "raise_tab_window":
@@ -178,6 +211,22 @@ async function handleMessage(msg) {
       return cycleTabInGroup(msg.direction);
     case "pick_rebind_group":
       return pickRebindGroup();
+    case "snapshot":
+      return snapshot();
+    case "group_tabs":
+      return runSerialized(() => groupTabs(msg.tab_ids, msg.group_id, msg.title, msg.color, msg.expected_title));
+    case "ungroup_tabs":
+      return runSerialized(() => ungroupTabs(msg.tab_ids));
+    case "update_group":
+      return runSerialized(() => updateGroup(msg.group_id, msg.expected_title, msg));
+    case "open_tabs":
+      return runSerialized(() => openTabs(msg.urls, msg.group_id, msg.title, msg.color));
+    case "pin_tabs":
+      return runSerialized(() => pinTabs(msg.tab_ids, msg.pinned === true));
+    case "reload_tabs":
+      return reloadTabs(msg.tab_ids);
+    case "stale_candidates":
+      return staleCandidates();
     default:
       throw new Error(`Unknown message type: ${msg.type}`);
   }
@@ -462,7 +511,11 @@ async function getTabs(groupName, all, active, locator, includeUngrouped) {
   return tabs;
 }
 
-async function closeTabs(requestedTabs) {
+// force is for a close the user picked by hand in a client: it drops the
+// active/pinned/audible guards, which exist for unattended and bulk cleanup.
+// The URL check stays either way — it is what stops a stale list from closing
+// a tab that has since navigated somewhere else.
+async function closeTabs(requestedTabs, force = false) {
   if (!Array.isArray(requestedTabs) || requestedTabs.length === 0) {
     return { closed: [], skipped: [] };
   }
@@ -500,15 +553,15 @@ async function closeTabs(requestedTabs) {
         skipped.push({ tab_id: tabId, reason: "URL changed" });
         continue;
       }
-      if (tab.active || protectedDuringClose.has(tabId)) {
+      if (!force && (tab.active || protectedDuringClose.has(tabId))) {
         skipped.push({ tab_id: tabId, reason: "tab became active" });
         continue;
       }
-      if (tab.pinned) {
+      if (!force && tab.pinned) {
         skipped.push({ tab_id: tabId, reason: "tab is pinned" });
         continue;
       }
-      if (tab.audible) {
+      if (!force && tab.audible) {
         skipped.push({ tab_id: tabId, reason: "tab is playing audio" });
         continue;
       }
@@ -524,10 +577,7 @@ async function closeTabs(requestedTabs) {
       }
       if (
         tab.url !== requested.expected_url ||
-        tab.active ||
-        tab.pinned ||
-        tab.audible ||
-        protectedDuringClose.has(tabId)
+        (!force && (tab.active || tab.pinned || tab.audible || protectedDuringClose.has(tabId)))
       ) {
         skipped.push({ tab_id: tabId, reason: "tab changed during close" });
         continue;
@@ -898,6 +948,221 @@ async function pickRebindGroup() {
     group_title: candidate.title || "(untitled)",
     source: "focused_window_first_group",
   };
+}
+
+// --- Terminal UI handlers ---
+// These address tabs and groups by id, the way a client that already holds a
+// snapshot knows them. Each re-reads Chrome before acting, and reports what it
+// skipped instead of failing the whole batch on one vanished tab.
+
+function tabView(t) {
+  return {
+    id: t.id,
+    title: t.title,
+    url: t.url,
+    group_id: t.groupId,
+    window_id: t.windowId,
+    index: t.index,
+    active: t.active,
+    pinned: t.pinned,
+    audible: t.audible,
+    last_accessed: t.lastAccessed,
+  };
+}
+
+async function snapshot() {
+  // Read seq before querying: an event raised after this point may or may not
+  // be in the result, so the client refetches for it — harmless. Reading it
+  // after could mark a change as seen that the query missed.
+  const seq = changeSeq;
+  const [groups, tabs] = await Promise.all([chrome.tabGroups.query({}), chrome.tabs.query({})]);
+  let focusedWindowId = null;
+  try {
+    focusedWindowId = (await chrome.windows.getLastFocused({ windowTypes: ["normal"] })).id;
+  } catch (_) {
+    focusedWindowId = null;
+  }
+  return {
+    epoch: EPOCH,
+    seq,
+    focused_window_id: focusedWindowId,
+    groups: groups.map((g) => ({
+      id: g.id,
+      title: g.title || "",
+      color: g.color,
+      collapsed: g.collapsed,
+      window_id: g.windowId,
+    })),
+    tabs: tabs.map(tabView),
+  };
+}
+
+function requireIds(ids, what) {
+  if (!Array.isArray(ids) || ids.length === 0 || !ids.every((id) => typeof id === "number")) {
+    throw new Error(`${what} requires a non-empty list of tab ids`);
+  }
+}
+
+async function fetchTabs(ids) {
+  return Promise.all(ids.map((id) => chrome.tabs.get(id).catch(() => null)));
+}
+
+async function requireGroup(groupId, expectedTitle) {
+  let group;
+  try {
+    group = await chrome.tabGroups.get(groupId);
+  } catch (_) {
+    throw new Error("Tab group no longer exists");
+  }
+  if (
+    typeof expectedTitle === "string" &&
+    normalizeGroupTitle(group.title || "") !== normalizeGroupTitle(expectedTitle)
+  ) {
+    throw new Error(`Refusing to change mismatched tab group: expected "${expectedTitle}", found "${group.title}"`);
+  }
+  return group;
+}
+
+// groupTabs puts tabs into the group with groupId, or into a new group titled
+// title when groupId is absent. A tab in another Chrome window is moved to the
+// group's window first; chrome.tabs.group would otherwise refuse it.
+async function groupTabs(tabIds, groupId, title, color, expectedTitle) {
+  requireIds(tabIds, "group_tabs");
+  const skipped = [];
+  const tabs = [];
+  for (const [i, tab] of (await fetchTabs(tabIds)).entries()) {
+    if (!tab) skipped.push({ tab_id: tabIds[i], reason: "tab no longer exists" });
+    else if (tab.pinned) skipped.push({ tab_id: tab.id, reason: "pinned tabs cannot be grouped" });
+    else tabs.push(tab);
+  }
+  if (tabs.length === 0) return { grouped: 0, skipped };
+
+  let windowId;
+  let target = null;
+  if (typeof groupId === "number") {
+    target = await requireGroup(groupId, expectedTitle);
+    windowId = target.windowId;
+  } else {
+    if (typeof title !== "string" || title.trim() === "") {
+      throw new Error("group_tabs needs a group_id or a title for the new group");
+    }
+    windowId = tabs[0].windowId;
+  }
+
+  const away = tabs.filter((t) => t.windowId !== windowId).map((t) => t.id);
+  if (away.length > 0) await chrome.tabs.move(away, { windowId, index: -1 });
+  const ids = tabs.map((t) => t.id);
+
+  if (target) {
+    await chrome.tabs.group({ tabIds: ids, groupId: target.id });
+  } else {
+    const newId = await chrome.tabs.group({ tabIds: ids, createProperties: { windowId } });
+    target = await chrome.tabGroups.update(newId, { title, ...(color ? { color } : {}) });
+  }
+  return { grouped: ids.length, group_id: target.id, group_title: target.title, window_id: target.windowId, skipped };
+}
+
+async function ungroupTabs(tabIds) {
+  requireIds(tabIds, "ungroup_tabs");
+  const skipped = [];
+  const ids = [];
+  for (const [i, tab] of (await fetchTabs(tabIds)).entries()) {
+    if (!tab) skipped.push({ tab_id: tabIds[i], reason: "tab no longer exists" });
+    else if (tab.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE) skipped.push({ tab_id: tab.id, reason: "not in a group" });
+    else ids.push(tab.id);
+  }
+  if (ids.length > 0) await chrome.tabs.ungroup(ids);
+  return { ungrouped: ids.length, skipped };
+}
+
+async function updateGroup(groupId, expectedTitle, props) {
+  if (typeof groupId !== "number") throw new Error("update_group requires group_id");
+  const group = await requireGroup(groupId, expectedTitle);
+  const update = {};
+  if (typeof props.title === "string") {
+    if (normalizeGroupTitle(group.title || "") === RESERVED_GROUP_TITLE) {
+      throw new Error(`Tab group "${RESERVED_GROUP_TITLE}" is reserved and cannot be renamed`);
+    }
+    if (props.title.trim() === "") throw new Error("Group title cannot be empty");
+    update.title = props.title;
+  }
+  if (typeof props.color === "string") update.color = props.color;
+  if (typeof props.collapsed === "boolean") update.collapsed = props.collapsed;
+  const updated = await chrome.tabGroups.update(group.id, update);
+  return { group_id: updated.id, group_title: updated.title, color: updated.color, window_id: updated.windowId };
+}
+
+// openTabs opens urls in the background. With groupId or title the new tabs
+// join that group: the group with groupId if it still exists, else the first
+// group titled title, else a new group titled title. An empty url opens a New
+// Tab page, which is how a client creates a group with nothing in it yet.
+async function openTabs(urls, groupId, title, color) {
+  if (!Array.isArray(urls) || urls.length === 0) throw new Error("open_tabs requires urls");
+  let group = null;
+  if (typeof groupId === "number") {
+    group = await chrome.tabGroups.get(groupId).catch(() => null);
+  }
+  if (!group && typeof title === "string" && title !== "") {
+    group = (await findGroupByTitle(title)) ?? null;
+  }
+  const windowId = group?.windowId;
+  const tabIds = [];
+  for (const url of urls) {
+    const props = { active: false, ...(windowId !== undefined ? { windowId } : {}) };
+    if (typeof url === "string" && url !== "") props.url = url;
+    tabIds.push((await chrome.tabs.create(props)).id);
+  }
+  let resultGroupId = chrome.tabGroups.TAB_GROUP_ID_NONE;
+  if (group) {
+    await chrome.tabs.group({ tabIds, groupId: group.id });
+    resultGroupId = group.id;
+  } else if (typeof title === "string" && title !== "") {
+    resultGroupId = await chrome.tabs.group({ tabIds });
+    await chrome.tabGroups.update(resultGroupId, { title, ...(color ? { color } : {}) });
+  }
+  return { opened: tabIds.length, tab_ids: tabIds, group_id: resultGroupId };
+}
+
+async function pinTabs(tabIds, pinned) {
+  requireIds(tabIds, "pin_tabs");
+  const skipped = [];
+  let changed = 0;
+  for (const [i, tab] of (await fetchTabs(tabIds)).entries()) {
+    if (!tab) {
+      skipped.push({ tab_id: tabIds[i], reason: "tab no longer exists" });
+      continue;
+    }
+    await chrome.tabs.update(tab.id, { pinned });
+    changed += 1;
+  }
+  return { changed, pinned, skipped };
+}
+
+async function reloadTabs(tabIds) {
+  requireIds(tabIds, "reload_tabs");
+  const skipped = [];
+  let reloaded = 0;
+  for (const id of tabIds) {
+    try {
+      await chrome.tabs.reload(id);
+      reloaded += 1;
+    } catch (_) {
+      skipped.push({ tab_id: id, reason: "tab no longer exists" });
+    }
+  }
+  return { reloaded, skipped };
+}
+
+// staleCandidates applies stale.js to every tab, grouped or not. Pull requests
+// come back unjudged; see stale.js for why.
+async function staleCandidates() {
+  const [groups, tabs] = await Promise.all([chrome.tabGroups.query({}), chrome.tabs.query({})]);
+  const titles = new Map(groups.map((g) => [g.id, g.title || "(untitled)"]));
+  const views = tabs.map((t) => ({
+    ...tabView(t),
+    group_title: t.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE ? "(ungrouped)" : titles.get(t.groupId) ?? "(untitled)",
+  }));
+  return self.TmuxChromeStale.scanTabs(views);
 }
 
 // --- Init ---
