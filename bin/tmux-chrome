@@ -116,17 +116,55 @@ function bridge_revive {
   fi
   trap 'rmdir "$lock" 2>/dev/null || true' RETURN
 
-  osascript -e "
-    tell application \"Google Chrome\"
-      open location \"chrome-extension://$CHROME_EXTENSION_ID/reload.html\"
-    end tell
-  " >/dev/null 2>&1 || return 1
+  # A failed revive is not retried on every window switch. Each attempt opens
+  # a tab, so a bridge that will not come back left a trail of them.
+  local stamp="/tmp/tmux-chrome-revive.failed"
+  if [[ -f "$stamp" ]] && (( $(date +%s) - $(stat -f %m "$stamp") < 300 )); then
+    return 1
+  fi
+
+  # `open location` lands in whichever profile is frontmost. With the
+  # extension installed in another profile that was an
+  # ERR_BLOCKED_BY_CLIENT tab in the frontmost one (every few minutes, since
+  # the hooks revive on window switch), and the bridge stayed down. Hand the
+  # URL to the profile that has the extension; Chrome's running instance takes
+  # the --profile-directory from the new process and opens it there.
+  local profile
+  profile="$(extension_profile)"
+  if [[ -z "$profile" ]]; then
+    touch "$stamp"
+    return 1
+  fi
+  open -na "Google Chrome" --args --profile-directory="$profile" \
+    "chrome-extension://$CHROME_EXTENSION_ID/reload.html" >/dev/null 2>&1 || {
+    touch "$stamp"
+    return 1
+  }
 
   local tries=0
   while (( tries < 20 )); do
     sleep 0.25
-    bridge_alive && return 0
+    bridge_alive && { rm -f "$stamp"; return 0; }
     ((tries++)) || true
+  done
+  touch "$stamp"
+  return 1
+}
+
+# The Chrome profile directory ("Profile 1") the extension is installed in.
+# An unpacked extension is recorded in that profile's Secure Preferences.
+function extension_profile {
+  if [[ -n "${TMUX_CHROME_PROFILE_DIR:-}" ]]; then
+    printf '%s\n' "$TMUX_CHROME_PROFILE_DIR"
+    return 0
+  fi
+  local root="$HOME/Library/Application Support/Google/Chrome" p
+  for p in "$root"/*/; do
+    p="${p%/}"
+    if grep -qs "$CHROME_EXTENSION_ID" "$p/Secure Preferences" "$p/Preferences"; then
+      basename "$p"
+      return 0
+    fi
   done
   return 1
 }
